@@ -22,7 +22,7 @@ export async function readdirAll(open: Open, pattern = "*"): Promise<DirEntry[]>
   // enumeration cursor, so the retry doesn't skip entries. The switch is sticky
   // for the rest of the listing, so each server self-selects its accepted form.
   let resendPatternOnContinuation = false;
-  for (;;) {
+  for (; ;) {
     const isFirst = first;
     const searchPattern = isFirst
       ? pattern
@@ -30,7 +30,7 @@ export async function readdirAll(open: Open, pattern = "*"): Promise<DirEntry[]>
         ? pattern
         : "";
     const body = encodeQueryDirectoryRequest({
-      fileInformationClass: FileInformationClass.FileIdBothDirectoryInformation,
+      fileInformationClass: FileInformationClass.FileBothDirectoryInformation,
       flags: isFirst ? QueryDirectoryFlag.RESTART_SCANS : 0,
       fileIndex: 0,
       fileId: open.fileId,
@@ -59,7 +59,7 @@ export async function readdirAll(open: Open, pattern = "*"): Promise<DirEntry[]>
     }
     if (resp.header.status === NTStatus.STATUS_NO_MORE_FILES) break;
     if (!isSuccess(resp.header.status)) {
-      throw new SmbError({ status: resp.header.status, message: `QUERY_DIRECTORY failed: ${statusName(resp.header.status)}` });
+      throw new SmbError({ status: resp.header.status, message: `QUERY_DIRECTORY failed: ${ statusName(resp.header.status) }` });
     }
     const buf = decodeQueryDirectoryResponse(resp.body, 64);
     if (buf.length === 0) break;
