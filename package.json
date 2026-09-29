@@ -49,6 +49,7 @@
     "test:watch": "vitest test/unit",
     "test:integration": "vitest run test/integration",
     "lint": "eslint .",
+    "prepare": "npm run build",
     "format": "prettier --write .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "verify": "npm run typecheck && npm run lint && npm test",
