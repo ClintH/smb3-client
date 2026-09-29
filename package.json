@@ -26,7 +26,9 @@
   "bugs": {
     "url": "https://github.com/euricojardim/smb3-client/issues"
   },
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -60,5 +62,9 @@
     "prettier": "^3.2.0",
     "typescript": "^5.4.0",
     "vitest": "^1.4.0"
+  },
+  "allowScripts": {
+    "esbuild@0.21.5": true,
+    "fsevents@2.3.3": true
   }
 }
