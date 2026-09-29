@@ -64,19 +64,26 @@ describe("readdirAll", () => {
     expect(items.map((x) => x.fileName)).toEqual(["a.txt", "b.txt", "c.txt"]);
   });
 
-  it("treats STATUS_NO_SUCH_FILE as end-of-enumeration (macOS smbd)", async () => {
+  it("retries with the search pattern when an empty continuation is rejected (Samba/Synology)", async () => {
     const ft = new FakeTransport();
+    // FileNameLength (utf16le bytes) of each QUERY_DIRECTORY request we send.
+    const patternLens: number[] = [];
     let call = 0;
     ft.onSend((frame) => {
       const smb = frame.subarray(4);
       if (smb.readUInt16LE(12) !== SmbCommand.QUERY_DIRECTORY) return;
       const messageId = smb.readBigUInt64LE(24);
+      patternLens.push(smb.readUInt16LE(64 + 26)); // body FileNameLength
       call++;
       if (call === 1) {
+        // First page returns entries.
         ft.deliver(qdResp(messageId, 0, Buffer.concat([dirEntry("a.txt", false), dirEntry("b.txt", true)])));
+      } else if (call === 2) {
+        // Continuation with empty FileName — Samba/Synology rejects it.
+        ft.deliver(qdResp(messageId, NTStatus.STATUS_OBJECT_NAME_INVALID, Buffer.alloc(0)));
       } else {
-        // macOS terminates with STATUS_NO_SUCH_FILE, not STATUS_NO_MORE_FILES.
-        ft.deliver(qdResp(messageId, NTStatus.STATUS_NO_SUCH_FILE, Buffer.alloc(0)));
+        // Retried continuation (pattern resent) succeeds and terminates.
+        ft.deliver(qdResp(messageId, NTStatus.STATUS_NO_MORE_FILES, Buffer.alloc(0)));
       }
     });
     const conn = new Connection(ft);
@@ -88,5 +95,8 @@ describe("readdirAll", () => {
     const open = new (Open as unknown as { new (...a: unknown[]): Open })(tree, Buffer.alloc(16, 0xfe), {} as never);
     const items = await readdirAll(open);
     expect(items.map((x) => x.fileName)).toEqual(["a.txt", "b.txt"]);
+    // first call sends "*" (2 bytes); the empty continuation (0) is rejected;
+    // the retry resends "*" (2 bytes).
+    expect(patternLens).toEqual([2, 0, 2]);
   });
 });

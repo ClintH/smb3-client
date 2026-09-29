@@ -13,16 +13,28 @@ import { SmbError } from "../errors.js";
 export async function readdirAll(open: Open, pattern = "*"): Promise<DirEntry[]> {
   const items: DirEntry[] = [];
   let first = true;
+  // Continuation FileName strategy. The canonical SMB2 continuation sends an
+  // EMPTY FileName (macOS and Windows accept this). Samba — including Synology
+  // DSM — rejects an empty continuation FileName with STATUS_OBJECT_NAME_INVALID.
+  // So we default to the canonical empty pattern and, on that specific reject,
+  // switch to resending the search pattern and retry the page. The reject is a
+  // parameter-validation error returned before the server advances the
+  // enumeration cursor, so the retry doesn't skip entries. The switch is sticky
+  // for the rest of the listing, so each server self-selects its accepted form.
+  let resendPatternOnContinuation = false;
   for (;;) {
+    const isFirst = first;
+    const searchPattern = isFirst
+      ? pattern
+      : resendPatternOnContinuation
+        ? pattern
+        : "";
     const body = encodeQueryDirectoryRequest({
-      // FileBothDirectoryInformation (class 3), not FileIdBothDirectoryInformation
-      // (class 37): macOS smbd rejects class 37 for QUERY_DIRECTORY with
-      // STATUS_NO_SUCH_FILE. Class 3 is honored by macOS, Windows, and Samba.
-      fileInformationClass: FileInformationClass.FileBothDirectoryInformation,
-      flags: first ? QueryDirectoryFlag.RESTART_SCANS : 0,
+      fileInformationClass: FileInformationClass.FileIdBothDirectoryInformation,
+      flags: isFirst ? QueryDirectoryFlag.RESTART_SCANS : 0,
       fileIndex: 0,
       fileId: open.fileId,
-      searchPattern: first ? pattern : "",
+      searchPattern,
       outputBufferLength: 65536,
     });
     first = false;
@@ -34,14 +46,18 @@ export async function readdirAll(open: Open, pattern = "*"): Promise<DirEntry[]>
       encrypt: open.tree.encryptRequired,
       creditCharge: 1,
     });
-    // macOS smbd signals end-of-enumeration with STATUS_NO_SUCH_FILE where
-    // Windows/Samba use STATUS_NO_MORE_FILES; treat both as terminal so an
-    // empty directory or an exhausted final page doesn't throw.
+    // A continuation with an empty FileName was rejected (Samba/Synology DSM):
+    // switch to resending the pattern and retry this page (the cursor has not
+    // advanced). Attempted once, then sticky for the rest of the listing.
     if (
-      resp.header.status === NTStatus.STATUS_NO_MORE_FILES ||
-      resp.header.status === NTStatus.STATUS_NO_SUCH_FILE
-    )
-      break;
+      !isFirst &&
+      !resendPatternOnContinuation &&
+      resp.header.status === NTStatus.STATUS_OBJECT_NAME_INVALID
+    ) {
+      resendPatternOnContinuation = true;
+      continue;
+    }
+    if (resp.header.status === NTStatus.STATUS_NO_MORE_FILES) break;
     if (!isSuccess(resp.header.status)) {
       throw new SmbError({ status: resp.header.status, message: `QUERY_DIRECTORY failed: ${statusName(resp.header.status)}` });
     }
