@@ -63,4 +63,30 @@ describe("readdirAll", () => {
     const items = await readdirAll(open);
     expect(items.map((x) => x.fileName)).toEqual(["a.txt", "b.txt", "c.txt"]);
   });
+
+  it("treats STATUS_NO_SUCH_FILE as end-of-enumeration (macOS smbd)", async () => {
+    const ft = new FakeTransport();
+    let call = 0;
+    ft.onSend((frame) => {
+      const smb = frame.subarray(4);
+      if (smb.readUInt16LE(12) !== SmbCommand.QUERY_DIRECTORY) return;
+      const messageId = smb.readBigUInt64LE(24);
+      call++;
+      if (call === 1) {
+        ft.deliver(qdResp(messageId, 0, Buffer.concat([dirEntry("a.txt", false), dirEntry("b.txt", true)])));
+      } else {
+        // macOS terminates with STATUS_NO_SUCH_FILE, not STATUS_NO_MORE_FILES.
+        ft.deliver(qdResp(messageId, NTStatus.STATUS_NO_SUCH_FILE, Buffer.alloc(0)));
+      }
+    });
+    const conn = new Connection(ft);
+    (conn as unknown as { negotiated: unknown }).negotiated = { dialect: Dialect.SMB_3_1_1 };
+    const tree = Object.assign(Object.create(Tree.prototype), {
+      conn, session: { sessionId: 0xabcdn, makeSigning: () => undefined },
+      treeId: 0x42, shareType: "disk", path: "x", maximalAccess: 0,
+    }) as Tree;
+    const open = new (Open as unknown as { new (...a: unknown[]): Open })(tree, Buffer.alloc(16, 0xfe), {} as never);
+    const items = await readdirAll(open);
+    expect(items.map((x) => x.fileName)).toEqual(["a.txt", "b.txt"]);
+  });
 });

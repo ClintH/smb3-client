@@ -34,7 +34,14 @@ export async function readdirAll(open: Open, pattern = "*"): Promise<DirEntry[]>
       encrypt: open.tree.encryptRequired,
       creditCharge: 1,
     });
-    if (resp.header.status === NTStatus.STATUS_NO_MORE_FILES) break;
+    // macOS smbd signals end-of-enumeration with STATUS_NO_SUCH_FILE where
+    // Windows/Samba use STATUS_NO_MORE_FILES; treat both as terminal so an
+    // empty directory or an exhausted final page doesn't throw.
+    if (
+      resp.header.status === NTStatus.STATUS_NO_MORE_FILES ||
+      resp.header.status === NTStatus.STATUS_NO_SUCH_FILE
+    )
+      break;
     if (!isSuccess(resp.header.status)) {
       throw new SmbError({ status: resp.header.status, message: `QUERY_DIRECTORY failed: ${statusName(resp.header.status)}` });
     }
