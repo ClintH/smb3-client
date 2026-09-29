@@ -21,6 +21,7 @@ export const FileInformationClass = {
   FileEndOfFileInformation: 20,
   FileRenameInformation: 10,
   FileDispositionInformation: 13,
+  FileBothDirectoryInformation: 3,
   FileIdBothDirectoryInformation: 37,
   FileIdFullDirectoryInformation: 38,
 } as const;

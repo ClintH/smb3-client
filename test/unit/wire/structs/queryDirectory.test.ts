@@ -3,6 +3,7 @@ import {
   encodeQueryDirectoryRequest,
   decodeQueryDirectoryResponse,
   parseFileIdBothDirectoryInformation,
+  parseFileBothDirectoryInformation,
 } from "../../../../src/wire/structs/queryDirectory.js";
 import { Writer } from "../../../../src/wire/buffer.js";
 
@@ -51,6 +52,32 @@ describe("QUERY_DIRECTORY", () => {
     const items = parseFileIdBothDirectoryInformation(w.buffer());
     expect(items.map((x) => x.fileName)).toEqual(["a.txt", "b.txt"]);
     expect(items[0]!.endOfFile).toBe(123n);
+  });
+
+  it("parses FileBothDirectoryInformation entries (class 3, no FileId trailer)", () => {
+    const w = new Writer();
+    function entry(name: string, isLast: boolean) {
+      const nameBuf = Buffer.from(name, "utf16le");
+      const recSize = 94 + nameBuf.length; // fixed header (no Reserved2+FileId) + name
+      const padded = (recSize + 7) & ~7;
+      w.u32(isLast ? 0 : padded);
+      w.u32(0);
+      w.u64(0n); w.u64(0n); w.u64(0n); w.u64(0n);
+      w.u64(456n); // EOF
+      w.u64(0n);
+      w.u32(0x80); // attrs
+      w.u32(nameBuf.length); // FileNameLength
+      w.u32(0); // EaSize
+      w.u8(0); w.u8(0); // ShortNameLength + Reserved1
+      w.bytes(Buffer.alloc(24)); // ShortName
+      w.bytes(nameBuf);
+      w.pad(padded - recSize);
+    }
+    entry("x.txt", false);
+    entry("y.txt", true);
+    const items = parseFileBothDirectoryInformation(w.buffer());
+    expect(items.map((x) => x.fileName)).toEqual(["x.txt", "y.txt"]);
+    expect(items[0]!.endOfFile).toBe(456n);
   });
 
   it("decodeQueryDirectoryResponse returns the embedded buffer", () => {

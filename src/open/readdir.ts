@@ -2,7 +2,7 @@ import type { Open } from "./open.js";
 import {
   encodeQueryDirectoryRequest,
   decodeQueryDirectoryResponse,
-  parseFileIdBothDirectoryInformation,
+  parseFileBothDirectoryInformation,
   QueryDirectoryFlag,
   DirEntry,
 } from "../wire/structs/queryDirectory.js";
@@ -15,7 +15,10 @@ export async function readdirAll(open: Open, pattern = "*"): Promise<DirEntry[]>
   let first = true;
   for (;;) {
     const body = encodeQueryDirectoryRequest({
-      fileInformationClass: FileInformationClass.FileIdBothDirectoryInformation,
+      // FileBothDirectoryInformation (class 3), not FileIdBothDirectoryInformation
+      // (class 37): macOS smbd rejects class 37 for QUERY_DIRECTORY with
+      // STATUS_NO_SUCH_FILE. Class 3 is honored by macOS, Windows, and Samba.
+      fileInformationClass: FileInformationClass.FileBothDirectoryInformation,
       flags: first ? QueryDirectoryFlag.RESTART_SCANS : 0,
       fileIndex: 0,
       fileId: open.fileId,
@@ -37,7 +40,7 @@ export async function readdirAll(open: Open, pattern = "*"): Promise<DirEntry[]>
     }
     const buf = decodeQueryDirectoryResponse(resp.body, 64);
     if (buf.length === 0) break;
-    const page = parseFileIdBothDirectoryInformation(buf);
+    const page = parseFileBothDirectoryInformation(buf);
     for (const e of page) items.push(e);
     if (page.length === 0) break;
   }

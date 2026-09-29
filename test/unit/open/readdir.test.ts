@@ -8,9 +8,11 @@ import { Writer } from "../../../src/wire/buffer.js";
 import { Dialect, SmbCommand, NTStatus } from "../../../src/wire/commands.js";
 import { readdirAll } from "../../../src/open/readdir.js";
 
+// FileBothDirectoryInformation (class 3): 94-byte fixed prefix + FileName.
+// (The FileId* variant, class 37, appends Reserved2(2)+FileId(8) = 104 bytes.)
 function dirEntry(name: string, isLast: boolean): Buffer {
   const nameBuf = Buffer.from(name, "utf16le");
-  const recSize = 104 + nameBuf.length;
+  const recSize = 94 + nameBuf.length;
   const padded = (recSize + 7) & ~7;
   const w = new Writer();
   w.u32(isLast ? 0 : padded);
@@ -18,7 +20,7 @@ function dirEntry(name: string, isLast: boolean): Buffer {
   w.u64(0n); w.u64(0n); w.u64(0n); w.u64(0n);
   w.u64(0n); w.u64(0n); w.u32(0x80);
   w.u32(nameBuf.length); w.u32(0); w.u8(0); w.u8(0);
-  w.bytes(Buffer.alloc(24)); w.u16(0); w.bytes(Buffer.alloc(8)); w.bytes(nameBuf);
+  w.bytes(Buffer.alloc(24)); w.bytes(nameBuf);
   w.pad(padded - recSize);
   return w.buffer();
 }
