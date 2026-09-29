@@ -2,7 +2,7 @@ import type { Open } from "./open.js";
 import {
   encodeQueryDirectoryRequest,
   decodeQueryDirectoryResponse,
-  parseFileIdBothDirectoryInformation,
+  parseFileBothDirectoryInformation,
   QueryDirectoryFlag,
   DirEntry,
 } from "../wire/structs/queryDirectory.js";
@@ -63,7 +63,7 @@ export async function readdirAll(open: Open, pattern = "*"): Promise<DirEntry[]>
     }
     const buf = decodeQueryDirectoryResponse(resp.body, 64);
     if (buf.length === 0) break;
-    const page = parseFileIdBothDirectoryInformation(buf);
+    const page = parseFileBothDirectoryInformation(buf);
     for (const e of page) items.push(e);
     if (page.length === 0) break;
   }
