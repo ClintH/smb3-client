@@ -40,4 +40,9 @@ export function encodeFileRenameInformation(inp: FileRenameInformationInputs): B
   return w.buffer();
 }
 
+/** FileDispositionInformation ([MS-FSCC] 2.4.11): a single DeletePending byte. */
+export function encodeFileDispositionInformation(deletePending: boolean): Buffer {
+  return Buffer.from([deletePending ? 1 : 0]);
+}
+
 export { InfoType, FileInformationClass };

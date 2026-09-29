@@ -54,10 +54,17 @@ export class Open {
 
   static async withOpen<T>(tree: Tree, req: CreateRequest, fn: (o: Open) => Promise<T>): Promise<T> {
     const open = await Open.create(tree, req);
+    let result: T;
     try {
-      return await fn(open);
-    } finally {
+      result = await fn(open);
+    } catch (err) {
+      // Keep the primary error; a secondary close failure must not mask it.
       try { await open.close(); } catch { /* swallow secondary close error */ }
+      throw err;
     }
+    // The CLOSE response carries the outcome of DELETE_ON_CLOSE (rm/rmdir), so
+    // on the success path its failure is the operation's failure.
+    await open.close();
+    return result;
   }
 }

@@ -20,7 +20,7 @@ import {
 } from "./wire/structs/create.js";
 import { splitSharePath, toSmbPath } from "./paths.js";
 import type { ClientOptions, Dirent, FileStat, ChangeEvent, ShareInfo } from "./types.js";
-import { encodeSetInfoRequest, encodeFileRenameInformation } from "./wire/structs/setInfo.js";
+import { encodeSetInfoRequest, encodeFileRenameInformation, encodeFileDispositionInformation } from "./wire/structs/setInfo.js";
 import { InfoType, FileInformationClass } from "./wire/structs/queryInfo.js";
 import { SmbCommand, Cipher, Capability, SecurityMode, isSuccess, statusName } from "./wire/commands.js";
 import { SmbError } from "./errors.js";
@@ -174,19 +174,20 @@ export class Client {
   }
 
   async rm(path: string): Promise<void> {
-    const { share, rest } = splitSharePath(path);
-    const tree = await this.treeFor(share);
-    await Open.withOpen(tree, {
-      filename: toSmbPath(rest),
-      desiredAccess: FileAccess.DELETE,
-      shareAccess: ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE,
-      createDisposition: CreateDisposition.OPEN,
-      createOptions: CreateOptions.NON_DIRECTORY_FILE | CreateOptions.DELETE_ON_CLOSE,
-      fileAttributes: 0,
-    }, async () => undefined);
+    await this.deletePath(path, CreateOptions.NON_DIRECTORY_FILE);
   }
 
   async rmdir(path: string): Promise<void> {
+    await this.deletePath(path, CreateOptions.DIRECTORY_FILE);
+  }
+
+  /**
+   * Deletes via SET_INFO FileDispositionInformation, whose response reports
+   * failures (e.g. STATUS_DIRECTORY_NOT_EMPTY) synchronously. The alternative,
+   * DELETE_ON_CLOSE, defers the delete to CLOSE, where servers such as Samba
+   * report success even though nothing was deleted.
+   */
+  private async deletePath(path: string, kind: number): Promise<void> {
     const { share, rest } = splitSharePath(path);
     const tree = await this.treeFor(share);
     await Open.withOpen(tree, {
@@ -194,9 +195,30 @@ export class Client {
       desiredAccess: FileAccess.DELETE,
       shareAccess: ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE,
       createDisposition: CreateDisposition.OPEN,
-      createOptions: CreateOptions.DIRECTORY_FILE | CreateOptions.DELETE_ON_CLOSE,
+      createOptions: kind,
       fileAttributes: 0,
-    }, async () => undefined);
+    }, async (open) => {
+      const body = encodeSetInfoRequest({
+        infoType: InfoType.FILE,
+        fileInformationClass: FileInformationClass.FileDispositionInformation,
+        fileId: open.fileId,
+        buffer: encodeFileDispositionInformation(true),
+      });
+      const signing = tree.session.makeSigning();
+      const resp = await tree.conn.send(SmbCommand.SET_INFO, body, {
+        sessionId: tree.session.sessionId,
+        treeId: tree.treeId,
+        ...(signing !== undefined ? { signing } : {}),
+        encrypt: tree.encryptRequired,
+        creditCharge: 1,
+      });
+      if (!isSuccess(resp.header.status)) {
+        throw new SmbError({
+          status: resp.header.status,
+          message: `SET_INFO delete failed: ${statusName(resp.header.status)}`,
+        });
+      }
+    });
   }
 
   async rename(from: string, to: string): Promise<void> {

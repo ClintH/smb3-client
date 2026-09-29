@@ -22,7 +22,7 @@ function makeCreateRespFrame(messageId: bigint, sessionId: bigint, treeId: numbe
   return Buffer.concat([hdr, w.buffer()]);
 }
 
-function makeCloseRespFrame(messageId: bigint, sessionId: bigint, treeId: number): Buffer {
+function makeCloseRespFrame(messageId: bigint, sessionId: bigint, treeId: number, status = 0): Buffer {
   const w = new Writer();
   w.u16(60); w.u16(0); w.u32(0);
   w.u64(0n); w.u64(0n); w.u64(0n); w.u64(0n);
@@ -30,7 +30,7 @@ function makeCloseRespFrame(messageId: bigint, sessionId: bigint, treeId: number
   const hdr = encodeHeader({
     command: SmbCommand.CLOSE,
     creditCharge: 1, creditRequestResponse: 1, flags: 0x1,
-    messageId, sessionId, treeId, status: 0,
+    messageId, sessionId, treeId, status,
   });
   return Buffer.concat([hdr, w.buffer()]);
 }
@@ -72,5 +72,45 @@ describe("Open / withOpen", () => {
     expect(threw).toBe(true);
     expect(opens).toBe(1);
     expect(closes).toBe(1);
+  });
+
+  const STATUS_DIRECTORY_NOT_EMPTY = 0xc0000101;
+
+  function treeWithCloseStatus(closeStatus: number): Tree {
+    const ft = new FakeTransport();
+    const fid = Buffer.alloc(16, 0xfe);
+    ft.onSend((frame) => {
+      const smb = frame.subarray(4);
+      const messageId = smb.readBigUInt64LE(24);
+      const cmd = smb.readUInt16LE(12);
+      if (cmd === SmbCommand.CREATE)
+        ft.deliver(makeCreateRespFrame(messageId, 0xabcdn, 0x42, fid, 100n));
+      else if (cmd === SmbCommand.CLOSE)
+        ft.deliver(makeCloseRespFrame(messageId, 0xabcdn, 0x42, closeStatus));
+    });
+    const conn = new Connection(ft);
+    (conn as unknown as { negotiated: unknown }).negotiated = { dialect: Dialect.SMB_3_1_1 };
+    const fakeSess = { sessionId: 0xabcdn, signingKey: Buffer.alloc(16), makeSigning: () => undefined } as never;
+    return Object.assign(Object.create(Tree.prototype), {
+      conn, session: fakeSess, treeId: 0x42, shareType: "disk", path: "\\\\srv\\share", maximalAccess: 0,
+    }) as Tree;
+  }
+
+  const deleteOnClose = {
+    filename: "dir",
+    desiredAccess: FileAccess.DELETE,
+    shareAccess: 7,
+    createDisposition: CreateDisposition.OPEN,
+    createOptions: CreateOptions.DIRECTORY_FILE | CreateOptions.DELETE_ON_CLOSE,
+  };
+
+  it("surfaces a CLOSE failure when the callback succeeded (DELETE_ON_CLOSE outcome)", async () => {
+    const tree = treeWithCloseStatus(STATUS_DIRECTORY_NOT_EMPTY);
+    await expect(Open.withOpen(tree, deleteOnClose, async () => "ok")).rejects.toThrow(/CLOSE failed/);
+  });
+
+  it("keeps the callback's error when CLOSE also fails", async () => {
+    const tree = treeWithCloseStatus(STATUS_DIRECTORY_NOT_EMPTY);
+    await expect(Open.withOpen(tree, deleteOnClose, async () => { throw new Error("primary"); })).rejects.toThrow("primary");
   });
 });
