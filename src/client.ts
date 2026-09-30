@@ -4,7 +4,7 @@ import { Connection } from "./connection/connection.js";
 import { Session } from "./session/session.js";
 import { Tree } from "./tree/tree.js";
 import { Open } from "./open/open.js";
-import { readAll } from "./open/read.js";
+import { readAll, readAt } from "./open/read.js";
 import { writeAll } from "./open/write.js";
 import { metaToStat } from "./open/query.js";
 import { readdirAll } from "./open/readdir.js";
@@ -119,6 +119,51 @@ export class Client {
       createOptions: CreateOptions.NON_DIRECTORY_FILE,
       fileAttributes: 0,
     }, async (open) => writeAll(open, 0n, buf));
+  }
+
+  /**
+   * Reads up to `length` bytes starting at `offset` (fewer at EOF, empty past
+   * it). SMB2 READ is natively positioned, so this never reads the bytes
+   * before `offset`.
+   */
+  async readRange(path: string, offset: number, length: number): Promise<Buffer> {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0)
+      throw new RangeError("readRange: offset and length must be non-negative safe integers");
+    if (length === 0) return Buffer.alloc(0);
+    const { share, rest } = splitSharePath(path);
+    const tree = await this.treeFor(share);
+    return Open.withOpen(tree, {
+      filename: toSmbPath(rest),
+      desiredAccess: FileAccess.FILE_READ_DATA | FileAccess.FILE_READ_ATTRIBUTES,
+      shareAccess: ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE,
+      createDisposition: CreateDisposition.OPEN,
+      createOptions: CreateOptions.NON_DIRECTORY_FILE,
+      fileAttributes: 0,
+    }, async (open) => {
+      const max = Number(open.meta.endOfFile) - offset;
+      if (max <= 0) return Buffer.alloc(0);
+      return readAt(open, BigInt(offset), Math.min(length, max));
+    });
+  }
+
+  /**
+   * Writes `data` at `offset`, creating the file if it does not exist and
+   * leaving every other byte untouched (no truncation). Writing past the end
+   * extends the file. SMB2 WRITE is natively positioned.
+   */
+  async writeRange(path: string, offset: number, data: Buffer): Promise<void> {
+    if (!Number.isSafeInteger(offset) || offset < 0)
+      throw new RangeError("writeRange: offset must be a non-negative safe integer");
+    const { share, rest } = splitSharePath(path);
+    const tree = await this.treeFor(share);
+    await Open.withOpen(tree, {
+      filename: toSmbPath(rest),
+      desiredAccess: FileAccess.GENERIC_WRITE | FileAccess.FILE_READ_ATTRIBUTES,
+      shareAccess: ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE,
+      createDisposition: CreateDisposition.OPEN_IF,
+      createOptions: CreateOptions.NON_DIRECTORY_FILE,
+      fileAttributes: 0,
+    }, async (open) => writeAll(open, BigInt(offset), data));
   }
 
   async readdir(path: string): Promise<string[]>;
