@@ -29,7 +29,7 @@ try {
   const dirents = await client.readdir(dir, { withFileTypes: true });
   console.log("readdir (withFileTypes):");
   for (const d of dirents) {
-    console.log(`  ${d.name}  isFile=${d.isFile()}  isDirectory=${d.isDirectory()}`);
+    console.log(`  ${d.name}  isFile=${d.isFile()}  isDirectory=${d.isDirectory()}  size=${d.size}  mtime=${d.mtime.toISOString()}`);
   }
 
   console.log("cleaning up ...");

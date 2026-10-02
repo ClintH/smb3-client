@@ -80,6 +80,42 @@ describe("QUERY_DIRECTORY", () => {
     expect(items[0]!.endOfFile).toBe(456n);
   });
 
+  it("parses class-3 time and size fields at the right offsets", () => {
+    const w = new Writer();
+    function entry(name: string, isLast: boolean, n: bigint) {
+      const nameBuf = Buffer.from(name, "utf16le");
+      const recSize = 94 + nameBuf.length;
+      const padded = (recSize + 7) & ~7;
+      w.u32(isLast ? 0 : padded);
+      w.u32(0);
+      w.u64(1000n + n); // CreationTime
+      w.u64(2000n + n); // LastAccessTime
+      w.u64(3000n + n); // LastWriteTime
+      w.u64(4000n + n); // ChangeTime
+      w.u64(5000n + n); // EndOfFile
+      w.u64(6000n + n); // AllocationSize
+      w.u32(0x20); // attrs
+      w.u32(nameBuf.length);
+      w.u32(0);
+      w.u8(0); w.u8(0);
+      w.bytes(Buffer.alloc(24));
+      w.bytes(nameBuf);
+      w.pad(padded - recSize);
+    }
+    entry("p.txt", false, 0n);
+    entry("q.txt", true, 10n);
+    const items = parseFileBothDirectoryInformation(w.buffer());
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({
+      fileName: "p.txt", fileAttributes: 0x20,
+      creationTime: 1000n, lastAccessTime: 2000n, lastWriteTime: 3000n, changeTime: 4000n, endOfFile: 5000n,
+    });
+    expect(items[1]).toMatchObject({
+      fileName: "q.txt", fileAttributes: 0x20,
+      creationTime: 1010n, lastAccessTime: 2010n, lastWriteTime: 3010n, changeTime: 4010n, endOfFile: 5010n,
+    });
+  });
+
   it("decodeQueryDirectoryResponse returns the embedded buffer", () => {
     const inner = Buffer.from("0011223344", "hex");
     const w = new Writer();

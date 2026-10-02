@@ -7,7 +7,7 @@ import { Open } from "./open/open.js";
 import { readAll, readAt } from "./open/read.js";
 import { writeAll } from "./open/write.js";
 import { metaToStat } from "./open/query.js";
-import { readdirAll } from "./open/readdir.js";
+import { readdirAll, direntFromEntry } from "./open/readdir.js";
 import { createReadStream as openCreateReadStream } from "./open/readStream.js";
 import { createWriteStream as openCreateWriteStream } from "./open/writeStream.js";
 import { watchOpen } from "./open/changeNotify.js";
@@ -15,7 +15,6 @@ import {
   CreateDisposition,
   CreateOptions,
   FileAccess,
-  FileAttribute,
   ShareAccess,
 } from "./wire/structs/create.js";
 import { splitSharePath, toSmbPath } from "./paths.js";
@@ -181,14 +180,7 @@ export class Client {
     }, async (open) => {
       const entries = await readdirAll(open);
       if (!opts?.withFileTypes) return entries.map((e) => e.fileName);
-      return entries.map((e) => {
-        const isDir = (e.fileAttributes & FileAttribute.DIRECTORY) !== 0;
-        return {
-          name: e.fileName,
-          isFile: () => !isDir,
-          isDirectory: () => isDir,
-        } satisfies Dirent;
-      });
+      return entries.map(direntFromEntry);
     });
   }
 

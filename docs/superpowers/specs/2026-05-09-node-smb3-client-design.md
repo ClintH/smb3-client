@@ -336,6 +336,9 @@ export interface Dirent {
   name: string;
   isFile(): boolean;
   isDirectory(): boolean;
+  size: number;          // EndOfFile, clamped to MAX_SAFE_INTEGER
+  mtime: Date;           // last write
+  ctime: Date;           // creation
 }
 
 export interface ShareInfo {

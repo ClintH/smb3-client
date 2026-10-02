@@ -9,6 +9,31 @@ import {
 import { FileInformationClass } from "../wire/structs/queryInfo.js";
 import { SmbCommand, NTStatus, isSuccess, statusName } from "../wire/commands.js";
 import { SmbError } from "../errors.js";
+import { FileAttribute } from "../wire/structs/create.js";
+import { smbTimeToDate } from "../paths.js";
+import type { Dirent } from "../types.js";
+
+/** Lists never throw for one oversized entry (unlike `metaToStat`): clamp instead. */
+function endOfFileToNumber(eof: bigint): number {
+  return eof > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(eof);
+}
+
+/**
+ * Maps a parsed directory entry to a `Dirent`. A zero FILETIME becomes
+ * `new Date(0)` (see `smbTimeToDate`); it cannot be told apart from a real
+ * 1970 timestamp, so consumers may treat epoch 0 as "unknown".
+ */
+export function direntFromEntry(e: DirEntry): Dirent {
+  const isDir = (e.fileAttributes & FileAttribute.DIRECTORY) !== 0;
+  return {
+    name: e.fileName,
+    isFile: () => !isDir,
+    isDirectory: () => isDir,
+    size: endOfFileToNumber(e.endOfFile),
+    mtime: smbTimeToDate(e.lastWriteTime),
+    ctime: smbTimeToDate(e.creationTime),
+  };
+}
 
 export async function readdirAll(open: Open, pattern = "*"): Promise<DirEntry[]> {
   const items: DirEntry[] = [];

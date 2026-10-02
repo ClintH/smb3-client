@@ -33,6 +33,22 @@ integrationDescribe("integration: CRUD", () => {
     await client.rm(path);
   });
 
+  it("readdir withFileTypes returns size and times", async () => {
+    const path = `${base}/meta.txt`;
+    const content = Buffer.from("twelve bytes", "utf8");
+    await client.writeFile(path, content);
+    try {
+      const entries = await client.readdir(base, { withFileTypes: true });
+      const e = entries.find((d) => d.name === "meta.txt");
+      expect(e).toBeDefined();
+      expect(e!.size).toBe(content.length);
+      expect(Math.abs(Date.now() - e!.mtime.getTime())).toBeLessThan(60_000);
+      expect(Number.isNaN(e!.ctime.getTime())).toBe(false);
+    } finally {
+      await client.rm(path);
+    }
+  });
+
   it("readdir lists newly created files", async () => {
     await client.writeFile(`${base}/a.txt`, Buffer.from("a"));
     await client.writeFile(`${base}/b.txt`, Buffer.from("b"));

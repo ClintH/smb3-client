@@ -17,6 +17,12 @@ export interface Dirent {
   name: string;
   isFile: () => boolean;
   isDirectory: () => boolean;
+  /** Size in bytes (`EndOfFile`). Servers usually report 0 for directories. Clamped to `Number.MAX_SAFE_INTEGER`. */
+  size: number;
+  /** Last write time. */
+  mtime: Date;
+  /** Creation time (same meaning as `FileStat.ctime`). A server that reports none yields `new Date(0)`. */
+  ctime: Date;
 }
 
 export interface ShareInfo {

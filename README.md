@@ -160,7 +160,7 @@ await client.writeFile("public/blob.bin", Buffer.from([0xde, 0xad]));
 ### `readdir(path): Promise<string[]>`
 ### `readdir(path, { withFileTypes: true }): Promise<Dirent[]>`
 
-Lists entries in a directory. Pass `{ withFileTypes: true }` to get `Dirent` objects with `isFile()` and `isDirectory()` methods.
+Lists entries in a directory. Pass `{ withFileTypes: true }` to get `Dirent` objects with `isFile()` and `isDirectory()` methods plus `size` (bytes), `mtime` (last write) and `ctime` (creation). These come from the directory listing itself, so no extra requests are made. Directory sizes are usually 0, and a zero creation time (e.g. FAT/exFAT shares) reads as the Unix epoch.
 
 ```ts
 const names = await client.readdir("public/inbox");
