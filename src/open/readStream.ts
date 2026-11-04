@@ -1,6 +1,6 @@
 import { Readable } from "node:stream";
 import type { Open } from "./open.js";
-import { readAt } from "./read.js";
+import { readAt, readChunkSize } from "./read.js";
 
 export interface ReadStreamOptions {
   start?: bigint;
@@ -15,7 +15,7 @@ export function createReadStream(open: Open, opts: ReadStreamOptions = {}): Read
   if (totalEnd < start) {
     return Readable.from([], { objectMode: false });
   }
-  const max = open.tree.conn.state?.maxReadSize ?? 65536;
+  const max = readChunkSize(open);
   const chunkSize = Math.min(max, opts.highWaterMark ?? max);
   const concurrency = Math.max(1, Math.min(opts.concurrency ?? 4, 8));
 
@@ -47,7 +47,9 @@ export function createReadStream(open: Open, opts: ReadStreamOptions = {}): Read
       stream.push(null);
       return;
     }
-    while (inFlight < concurrency && nextOffset <= totalEnd) {
+    // Bound read-ahead (in flight + completed but not yet consumed) so a slow consumer
+    // cannot make us buffer the whole file.
+    while (inFlight < concurrency && inFlight + buffers.size < concurrency * 2 && nextOffset <= totalEnd) {
       const remaining = totalEnd - nextOffset + 1n;
       const want = remaining > BigInt(chunkSize) ? BigInt(chunkSize) : remaining;
       const offset = nextOffset;

@@ -48,6 +48,20 @@ interface PendingRequest {
   reject: (err: unknown) => void;
   expectsAsync: boolean;
   encrypted: boolean;
+  /** Credits this request consumed, returned to the in-flight accounting on its final response. */
+  charge: number;
+}
+
+/** Size of one SMB2 credit: the unit of CreditCharge for READ/WRITE (MS-SMB2 §3.1.5.2). */
+export const CREDIT_UNIT = 65536;
+/** Largest single READ/WRITE we issue, even if the server allows more (matches Linux cifs). */
+const MAX_IO_SIZE = 1 << 20;
+/** Credit window we try to keep open with the server; it may grant less. */
+const TARGET_CREDITS = 64;
+
+/** Number of credits a READ/WRITE payload of `bytes` consumes. */
+export function creditChargeFor(bytes: number): number {
+  return Math.max(1, Math.ceil(bytes / CREDIT_UNIT));
 }
 
 export interface SendOptions {
@@ -66,6 +80,10 @@ export class Connection extends EventEmitter {
   /** Tracks the asyncId assigned by the server for pending async requests, keyed by messageId string. */
   private asyncIdByMessageId = new Map<string, bigint>();
   private credits = new CreditWindow(1);
+  /** Credits consumed by requests whose final response has not arrived yet. */
+  private inflightCharge = 0;
+  /** Most credits we have ever owned at once (available + in flight): what the server has really granted. */
+  private peakCredits = 1;
   private preauth = new PreauthHash();
   private negotiated: NegotiatedConnection | null = null;
   private closed = false;
@@ -84,6 +102,21 @@ export class Connection extends EventEmitter {
 
   get state(): NegotiatedConnection | null {
     return this.negotiated;
+  }
+
+  /**
+   * Largest READ/WRITE payload that is safe to send right now. Multi-credit I/O
+   * needs LARGE_MTU (MS-SMB2 §3.2.4.1.5); without it the limit is one credit
+   * (64 KiB). The size is also bounded by the credits the server has actually
+   * granted so far, so a stingy server can never leave a request waiting on
+   * credits that will not arrive.
+   */
+  maxIoSize(serverMax: number): number {
+    const largeMtu = ((this.negotiated?.capabilities ?? 0) & Capability.LARGE_MTU) !== 0;
+    const ceiling = largeMtu
+      ? Math.min(MAX_IO_SIZE, Math.max(1, this.peakCredits) * CREDIT_UNIT)
+      : CREDIT_UNIT;
+    return Math.max(1, Math.min(serverMax, ceiling));
   }
 
   async open(opts: ConnectionOpenOptions = {}): Promise<NegotiatedConnection> {
@@ -136,14 +169,24 @@ export class Connection extends EventEmitter {
     if (this.closed) throw new SmbProtocolError({ status: 0, message: "connection closed" });
     const charge = opts.creditCharge ?? 1;
     if (charge > 0) await this.credits.take(charge);
-    const messageId = this.nextMessageId++;
+    // A multi-credit request occupies CreditCharge consecutive message IDs
+    // (MS-SMB2 §3.2.4.1.3); the header carries the first.
+    const messageId = this.nextMessageId;
+    this.nextMessageId += BigInt(Math.max(1, charge));
+    this.inflightCharge += charge;
+    // Ask for enough credits to bring our window back up to TARGET_CREDITS once
+    // this request completes; this is what lets several requests overlap.
+    const creditRequest = Math.min(
+      0xffff,
+      Math.max(1, TARGET_CREDITS - (this.credits.available() + this.inflightCharge) + charge),
+    );
     const flags = opts.flags ?? 0;
     const wantEncrypt = opts.encrypt === true && this.encryptor !== null;
 
     let header = encodeHeader({
       command,
       creditCharge: charge,
-      creditRequestResponse: 1,
+      creditRequestResponse: creditRequest,
       flags,
       messageId,
       sessionId: opts.sessionId ?? 0n,
@@ -158,7 +201,7 @@ export class Connection extends EventEmitter {
       header = encodeHeader({
         command,
         creditCharge: charge,
-        creditRequestResponse: 1,
+        creditRequestResponse: creditRequest,
         flags: signedFlags,
         messageId,
         sessionId: opts.sessionId ?? 0n,
@@ -181,6 +224,7 @@ export class Connection extends EventEmitter {
       this.pendingByMessageId.set(messageId.toString(), {
         resolve,
         reject,
+        charge,
         expectsAsync: command === SmbCommand.CHANGE_NOTIFY,
         encrypted: wantEncrypt,
       });
@@ -312,6 +356,7 @@ export class Connection extends EventEmitter {
           this.pendingByAsyncId.delete(asyncKey);
           // Clean up the reverse mapping.
           this.asyncIdByMessageId.delete(messageKey);
+          this.settle(a);
           a.resolve({ header, body });
           return;
         }
@@ -326,11 +371,23 @@ export class Connection extends EventEmitter {
       this.pendingByAsyncId.set(header.asyncId.toString(), pending);
       this.asyncIdByMessageId.set(messageKey, header.asyncId);
       this.pendingByMessageId.delete(messageKey);
+      this.notePeakCredits();
       return;
     }
 
     this.pendingByMessageId.delete(messageKey);
+    this.settle(pending);
     pending.resolve({ header, body });
+  }
+
+  private notePeakCredits(): void {
+    this.peakCredits = Math.max(this.peakCredits, this.credits.available() + this.inflightCharge);
+  }
+
+  /** A request has received its final response: its credits are no longer "in flight". */
+  private settle(p: PendingRequest): void {
+    this.inflightCharge -= p.charge;
+    this.notePeakCredits();
   }
 
   private onClose(): void {
@@ -349,6 +406,7 @@ export class Connection extends EventEmitter {
     this.pendingByMessageId.clear();
     this.pendingByAsyncId.clear();
     this.asyncIdByMessageId.clear();
+    this.inflightCharge = 0;
   }
 
   cancel(opts: { messageId: bigint; asyncId?: bigint; sessionId?: bigint; treeId?: number }): void {
