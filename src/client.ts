@@ -36,6 +36,8 @@ import {
   SRVSVC_MINOR,
 } from "./rpc/srvsvc.js";
 
+import { StorageHandle, type StorageOpenOptions, type StorageStat } from './storage.js';
+
 export class Client {
   private conn: Connection | null = null;
   private session: Session | null = null;
@@ -182,6 +184,37 @@ export class Client {
       if (!opts?.withFileTypes) return entries.map((e) => e.fileName);
       return entries.map(direntFromEntry);
     });
+  }
+
+  /** Low-level persistent storage operations for verified/resumable consumers. */
+  async openStorage(path: string, opts: StorageOpenOptions = {}): Promise<StorageHandle> {
+    const { share, rest } = splitSharePath(path);
+    const tree = await this.treeFor(share);
+    const read = opts.read ?? !opts.write;
+    let access: number = FileAccess.FILE_READ_ATTRIBUTES;
+    if (read && !opts.directory) access |= FileAccess.FILE_READ_DATA;
+    if (opts.write) access |= FileAccess.FILE_WRITE_DATA | FileAccess.FILE_WRITE_ATTRIBUTES;
+    if (opts.writeAttributes) access |= FileAccess.FILE_WRITE_ATTRIBUTES;
+    if (opts.deleteAccess || opts.deleteOnClose) access |= FileAccess.DELETE;
+    const disposition = opts.exclusive ? CreateDisposition.CREATE
+      : opts.truncate ? (opts.create ? CreateDisposition.OVERWRITE_IF : CreateDisposition.OVERWRITE)
+      : opts.create ? CreateDisposition.OPEN_IF : CreateDisposition.OPEN;
+    const handle = await Open.create(tree, {
+      filename: toSmbPath(rest), desiredAccess: access,
+      shareAccess: opts.shareAccess ?? (ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE),
+      createDisposition: disposition,
+      // OPEN_REPARSE_POINT: inspect the object itself, never silently follow it.
+      createOptions: 0x00200000 | (opts.directory === true ? CreateOptions.DIRECTORY_FILE
+        : opts.directory === false ? CreateOptions.NON_DIRECTORY_FILE : 0)
+        | (opts.deleteOnClose ? CreateOptions.DELETE_ON_CLOSE : 0),
+      fileAttributes: 0,
+    });
+    return new StorageHandle(handle);
+  }
+
+  async statStorage(path: string): Promise<StorageStat> {
+    const handle = await this.openStorage(path, { read: false });
+    try { return await handle.stat(); } finally { await handle.close(); }
   }
 
   async stat(path: string): Promise<FileStat> {
