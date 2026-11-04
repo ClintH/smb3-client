@@ -50,8 +50,10 @@ export class Client {
     if (this.state !== "idle") throw new Error(`Client.connect: state=${this.state}`);
     const transport = await TcpTransport.connect(this.opts.host, this.opts.port ?? 445, {
       timeoutMs: this.opts.connectTimeout ?? 10_000,
+      ...(this.opts.signal ? { signal: this.opts.signal } : {}),
     });
-    this.conn = new Connection(transport);
+    if (this.state !== "idle") { transport.close(); throw Object.assign(new Error("connection cancelled"), { code: "ECANCELED" }); }
+    this.conn = new Connection(transport, { requestTimeoutMs: this.opts.requestTimeout ?? 30000 });
     const encryption = this.opts.encryption ?? "if-offered";
     const signing = this.opts.signing ?? "if-offered";
     const ciphers =
@@ -556,6 +558,14 @@ export class Client {
       });
     }
     return decodeReadResponse(readResp.body);
+  }
+
+  /** Immediately close the transport, rejecting pending requests and credit waiters.
+   * Remote write/rename outcomes may be uncertain; callers must reconcile. */
+  abort(): void {
+    this.state = "closed";
+    this.conn?.close();
+    this.trees.clear();
   }
 
   async close(): Promise<void> {

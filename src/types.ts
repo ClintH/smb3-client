@@ -50,6 +50,8 @@ export interface ClientOptions {
   username: string;
   password: string;
   connectTimeout?: number;
+  /** Abort TCP establishment before protocol setup. */
+  signal?: AbortSignal;
   requestTimeout?: number;
   signing?: "disabled" | "if-offered" | "required";
   encryption?: "required" | "if-offered" | "disabled";

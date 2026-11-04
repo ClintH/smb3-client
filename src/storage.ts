@@ -111,7 +111,7 @@ export class StorageHandle {
   /** Target is relative to this handle's share. Existing targets are refused by default. */
   async rename(path: string, replaceIfExists = false): Promise<void> {
     if (path.startsWith('/') || path.includes('\\') || path.split('/').some(part => !part || part === '.' || part === '..')) throw new Error('Invalid rename target.');
-    await this.set(FileInformationClass.FileRenameInformation, encodeFileRenameInformation({ fileName: path, replaceIfExists }));
+    await this.set(FileInformationClass.FileRenameInformation, encodeFileRenameInformation({ fileName: path.replace(/\//g, '\\'), replaceIfExists }));
   }
 
   async close(): Promise<void> { await this.open.close(); }

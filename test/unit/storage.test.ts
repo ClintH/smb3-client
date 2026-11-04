@@ -52,6 +52,7 @@ describe('persistent storage handle', () => {
     await handle.rename('out/file'); await handle.rename('out/file', true);
     expect((send.mock.calls[0] as unknown as [number, Buffer])[1][32]).toBe(0);
     expect((send.mock.calls[1] as unknown as [number, Buffer])[1][32]).toBe(1);
+    expect((send.mock.calls[0] as unknown as [number, Buffer])[1].subarray(52).toString('utf16le')).toBe('out\\file');
     await handle.close(); expect(close).toHaveBeenCalledOnce();
   });
 });

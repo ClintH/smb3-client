@@ -27,9 +27,11 @@ export class TcpTransport extends EventEmitter implements Transport {
     });
   }
 
-  static connect(host: string, port = 445, opts: { timeoutMs?: number } = {}): Promise<TcpTransport> {
+  static connect(host: string, port = 445, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<TcpTransport> {
     return new Promise((resolve, reject) => {
+      if (opts.signal?.aborted) { reject(Object.assign(new Error("connection cancelled"), { code: "ECANCELED" })); return; }
       const sock = connect({ host, port });
+      const cancel = () => sock.destroy(Object.assign(new Error("connection cancelled"), { code: "ECANCELED" }));
       const onError = (err: Error) => {
         cleanup();
         reject(err);
@@ -41,11 +43,14 @@ export class TcpTransport extends EventEmitter implements Transport {
       let timer: NodeJS.Timeout | null = null;
       const cleanup = () => {
         if (timer) clearTimeout(timer);
+        opts.signal?.removeEventListener("abort", cancel);
         sock.off("error", onError);
         sock.off("connect", onConnect);
       };
       sock.once("error", onError);
       sock.once("connect", onConnect);
+      opts.signal?.addEventListener("abort", cancel, { once: true });
+      if (opts.signal?.aborted) cancel();
       if (opts.timeoutMs && opts.timeoutMs > 0) {
         timer = setTimeout(() => {
           sock.destroy(new Error(`connect timeout after ${opts.timeoutMs}ms`));
@@ -62,6 +67,6 @@ export class TcpTransport extends EventEmitter implements Transport {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    this.socket.end();
+    this.socket.destroy();
   }
 }

@@ -93,7 +93,7 @@ export class Connection extends EventEmitter {
   private encryptionRequired = false;
   private signingRequired = false;
 
-  constructor(private readonly transport: Transport) {
+  constructor(private readonly transport: Transport, private readonly options: { requestTimeoutMs?: number } = {}) {
     super();
     transport.on("message", (msg: Buffer) => this.onMessage(msg));
     transport.on("close", () => this.onClose());
@@ -161,7 +161,19 @@ export class Connection extends EventEmitter {
     return this.negotiated;
   }
 
-  async send(
+  async send(command: number, body: Buffer, opts: SendOptions = {}): Promise<{ header: SmbHeader; body: Buffer }> {
+    const timeout = this.options.requestTimeoutMs ?? 0;
+    if (!timeout || command === SmbCommand.CHANGE_NOTIFY) return this.sendRequest(command, body, opts);
+    const timer = setTimeout(() => {
+      const error = Object.assign(new SmbProtocolError({ status: 0, message: "SMB request timed out" }), { code: "ETIMEDOUT" });
+      this.abortConnection(error);
+    }, timeout);
+    timer.unref();
+    try { return await this.sendRequest(command, body, opts); }
+    finally { clearTimeout(timer); }
+  }
+
+  private async sendRequest(
     command: number,
     body: Buffer,
     opts: SendOptions = {},
@@ -169,6 +181,7 @@ export class Connection extends EventEmitter {
     if (this.closed) throw new SmbProtocolError({ status: 0, message: "connection closed" });
     const charge = opts.creditCharge ?? 1;
     if (charge > 0) await this.credits.take(charge);
+    if (this.closed) throw new SmbProtocolError({ status: 0, message: "connection closed" });
     // A multi-credit request occupies CreditCharge consecutive message IDs
     // (MS-SMB2 §3.2.4.1.3); the header carries the first.
     const messageId = this.nextMessageId;
@@ -230,7 +243,8 @@ export class Connection extends EventEmitter {
       });
     });
     const wire = wantEncrypt ? this.encryptor!.encrypt(frameBuf) : frameBuf;
-    this.transport.send(makeFrame(wire));
+    try { this.transport.send(makeFrame(wire)); }
+    catch { this.abortConnection(new SmbProtocolError({ status: 0, message: "transport send failed" })); }
     return promise;
   }
 
@@ -391,16 +405,18 @@ export class Connection extends EventEmitter {
   }
 
   private onClose(): void {
+    if (this.closed) return;
     this.closed = true;
     this.fail(new SmbProtocolError({ status: 0, message: "connection closed" }));
     this.emit("close");
   }
 
   private onError(err: Error): void {
-    this.fail(new SmbProtocolError({ status: 0, message: err.message, cause: err }));
+    this.abortConnection(new SmbProtocolError({ status: 0, message: err.message, cause: err }));
   }
 
   private fail(err: SmbProtocolError): void {
+    this.credits.fail(err);
     for (const p of this.pendingByMessageId.values()) p.reject(err);
     for (const p of this.pendingByAsyncId.values()) p.reject(err);
     this.pendingByMessageId.clear();
@@ -449,9 +465,15 @@ export class Connection extends EventEmitter {
     this.transport.send(makeFrame(wire));
   }
 
-  close(): void {
+  private abortConnection(error: SmbProtocolError): void {
     if (this.closed) return;
     this.closed = true;
+    this.fail(error);
+    this.emit("close");
     this.transport.close();
+  }
+
+  close(): void {
+    this.abortConnection(new SmbProtocolError({ status: 0, message: "connection closed" }));
   }
 }

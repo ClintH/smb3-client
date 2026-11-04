@@ -176,6 +176,46 @@ const s = await client.stat("public/report.pdf");
 console.log(s.size, s.mtime, s.isFile, s.isDirectory);
 ```
 
+### Persistent storage API (local fork)
+
+Verified/resumable consumers such as blocktransfer can use `openStorage(path, options)`
+and `statStorage(path)`. These are additions in this fork, beyond the upstream
+convenience API. Paths retain the `share/path` convention.
+
+```ts
+const handle = await client.openStorage("public/private-stage", {
+  read: true, write: true, create: true, exclusive: true, directory: false,
+});
+try {
+  await handle.write(0, Buffer.from("contents"));
+  await handle.sync(); // actual SMB2 FLUSH, not just a buffered write
+  const info = await handle.stat();
+  console.log(info.id); // lossless decimal FileInternalInformation.IndexNumber
+} finally {
+  await handle.close();
+}
+```
+
+`StorageHandle` supports positioned `read(position, length)` and `write(position,
+data)`, `truncate(size)`, `sync()`, `stat()`, `setMetadata({atime?, mtime?, readonly?})`,
+`rename(shareRelativePath, replaceIfExists = false)` and `close()`. Rename normalizes
+wire separators and refuses existing targets unless replacement is explicit.
+`StorageStat` includes `id`, `nlink` and `reparsePoint` in addition to `FileStat`.
+Zero/unsupported stable IDs fail rather than inventing an identity.
+
+Open options include `read`, `write`, `writeAttributes`, `create`, `exclusive`,
+`truncate`, `directory`, `shareAccess`, `deleteAccess` and `deleteOnClose`. Setting
+`shareAccess: 0` obtains an exclusive server-held handle; combining it with
+`deleteOnClose` supports lock files without using a remote machine's PID.
+Persistent handles are not reconnectable SMB durable handles. Reparse points are
+opened as objects, not silently followed; consumers must inspect/reject them.
+Metadata exposes Windows attributes/times, not POSIX ACLs or mode bits.
+
+`requestTimeout` is enforced for ordinary requests (default 30000 ms), including
+waiting for credits. A timeout closes the connection and rejects pending/credit-
+waiting operations; completion may be uncertain and must be reconciled. Long-lived
+CHANGE_NOTIFY requests are exempt. `connectTimeout` covers TCP establishment.
+
 ### `mkdir(path): Promise<void>`
 
 Creates a directory (non-recursive).
