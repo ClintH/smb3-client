@@ -1,135 +1,127 @@
-# smb3-client: size and times in `readdir`
+# Improvements for `smb3-client`, from comparing it with `smb2` (Rust)
 
-Goal: let `plugin-fs-smb` fill `internal.fs/entry` (`size`, `modifiedMs`, `createdMs`) from the directory listing itself, with no extra round trips. Part A is done in the **`ClintH/smb3-client` fork**. Part B is done afterwards in **fand**.
+Measured 2026-11-09 against `//igloo.local/Temp` (SMB 3.1.1, 5–14 ms RTT, mean 7.8 ms), from macOS arm64, Node v26.3.1.
+Client under test: `@clinth/smb3-client` 0.2.2 (the `ClintH/smb3-client` fork). I read the built `dist/` of that version and the
+fork's `src/` layout; the fork's working tree has uncommitted changes (`package.json`, `src/connection/connection.ts`) that I did not
+read, so check file and line references against your tree. Reference implementation: `smb2` crate 0.43.0 / CLI 0.7.3
+(`vdavid/smb2`, MIT OR Apache-2.0), source read at `crates/smb2/src/client/`.
 
-Background: see `plans/concepts-review.md` ("SMB listings have no size or times"). In short, SMB's `QUERY_DIRECTORY` already returns size and times for every entry, the fork parses them, and `Client.readdir(path, { withFileTypes: true })` throws them away.
+## Summary
 
-## What the code looks like today (fork at `c4fce8b`, `/Users/af4766/repos/smb3-client`)
+Nothing here argues for a Rust binding. The one large gap is **request concurrency on reads**, and it is a JavaScript fix.
 
-- `src/wire/structs/queryDirectory.ts`: `parseFileBothDirectoryInformation(buf)` returns `DirEntry[]`: `{ fileName, endOfFile: bigint, fileAttributes, creationTime: bigint, lastAccessTime: bigint, lastWriteTime: bigint, changeTime: bigint }` (raw FILETIME: 100 ns ticks since 1601). Already decoded; nothing to change in the wire layer.
-- `src/open/readdir.ts`: `readdirAll(open, pattern)` pages `QUERY_DIRECTORY` (class `FileBothDirectoryInformation`) and returns `DirEntry[]`.
-- `src/client.ts` (`readdir`, around line 169-193): for `{ withFileTypes: true }` it maps each `DirEntry` to `{ name, isFile, isDirectory } satisfies Dirent`. **This is where size and times are dropped.** The overloads are `readdir(path): Promise<string[]>` and `readdir(path, { withFileTypes: true }): Promise<Dirent[]>`.
-- `src/types.ts`: `Dirent = { name; isFile(): boolean; isDirectory(): boolean }`. `FileStat` already has `size`, `ctime` (creation), `atime`, `mtime`, `changeTime`.
-- `src/open/query.ts`: `metaToStat` converts the same raw fields with `smbTimeToDate` (`src/paths.ts`: `0n` returns `new Date(0)`, otherwise `Number(ft / 10000n - 11644473600000n)`). It throws `RangeError` when `endOfFile` exceeds `Number.MAX_SAFE_INTEGER`.
-- `src/index.ts` exports `Dirent` as a type; the package exports only its entry point.
-- Tooling: `npm run verify` = `typecheck` + `lint` (eslint) + `test` (`vitest run test/unit`). `test:integration` runs `test/integration`, gated by `test/helpers/integrationGate.ts`. **`dist/` is gitignored**: consumers get it from the `prepare` script (`tsc`) when they install the git dependency, so there is nothing to commit or rebuild by hand.
+| 256 MiB download, same share                                     |             MiB/s |
+| ---------------------------------------------------------------- | ----------------: |
+| smb2 CLI (`smb2 get`)                                            | 47–53 (5.0–5.5 s) |
+| macOS mount (`cp`)                                               |             42–44 |
+| smb3-client, 1 request in flight (what blocktransfer does today) |             30–31 |
+| smb3-client, 4 requests in flight, 1 MiB each                    |             46–49 |
+| smb3-client, 8 requests in flight, 1 MiB each                    |             50–53 |
 
-Existing tests to build on:
+With 4–8 requests in flight the client reaches the same rate as smb2 and the link. Uploads are different: smb2, `cp` and
+smb3-client all land at 7–9 MiB/s (256 MiB: smb2 29.8–33.2 s, `cp` 34.0–38.8 s; 64 MiB with smb3-client: 7.4 MiB/s at 1 request,
+8.6 MiB/s at 8). That share's write speed is the limit, so **no client change was shown to help uploads**, and upload work should wait
+for a server that writes faster.
 
-- `test/unit/wire/structs/queryDirectory.test.ts`: builds class-3 buffers by hand (`entry()` helper writing 94-byte prefix + name) and asserts `fileName` and `endOfFile`. It zeroes all the times, so the time fields are not currently asserted anywhere.
-- `test/unit/open/readdir.test.ts`: a `dirEntry(name, isLast)` buffer helper (also zero times, hard-coded `endOfFile = 0`), `qdResp()`, `FakeTransport` (`test/helpers/fakeTransport.ts`), and a hand-built `Connection`/`Tree`/`Open`, used by the paging and Samba-continuation tests.
-- `test/unit/client.readdir-shape.test.ts`: only asserts that `readdir` is a function. There is **no existing test of the `withFileTypes` mapping**, so the mapping needs to be made testable (A2).
-- `test/unit/open/query.test.ts`: how `metaToStat` is tested; copy its style.
-- `test/unit/paths.test.ts`: no test of `smbTimeToDate` at all.
-- `test/integration/crud.test.ts`: `readdir` tests use the `string[]` form only.
+## Evidence that encryption is not the cause
 
-## Part A: change in the fork
+The first benchmark showed direct reads at 0.57× the mount (31.9 vs 55.6 MiB/s) and the direct session was encrypted
+(`globalEncrypt: true`, cipher id 2) while the mount was not (`SMB_CURR_ENCRYPT_ALGORITHM OFF`). To separate the two, the same file was
+read with `encryption: 'if-offered'` and `'disabled'`, one request at a time: 31.2 vs 31.3 MiB/s (a first, cold run of the
+unencrypted case gave 16.8 MiB/s and should be ignored). Encryption costs nothing measurable at this link speed. It is untested at
+gigabit rates, where JavaScript AES-GCM could become the limit.
 
-### A1. Extend `Dirent` (additive, non-breaking)
+## Findings, in priority order
 
-`src/types.ts`:
+### 1. `StorageHandle.read` issues one request at a time (high)
 
-```ts
-export interface Dirent {
-  name: string;
-  isFile: () => boolean;
-  isDirectory: () => boolean;
-  /** Size in bytes (`EndOfFile`). Servers usually report 0 for directories. Clamped to `Number.MAX_SAFE_INTEGER`. */
-  size: number;
-  /** Last write time. */
-  mtime: Date;
-  /** Creation time (same meaning as `FileStat.ctime`). A server that reports none yields `new Date(0)`. */
-  ctime: Date;
-}
-```
+`src/open/read.ts` `readAt` loops `while (got < length) { await readOnce(...) }`. Each READ waits for the previous answer, so a
+read costs one round trip per chunk. At 7.8 ms RTT and 1 MiB per request, one request in flight tops out near 31 MiB/s here, while
+the link allows about 50. `readAll` and `readRange` pipeline (4 at a time, `READ_CONCURRENCY`), but `StorageHandle.read(position,
+length)`, the call blocktransfer uses, does not.
 
-Names match `FileStat` so a caller can treat a `Dirent` and a `FileStat` alike. Leave `atime` and `changeTime` out; nothing needs them. Check that no existing code constructs a `Dirent` literal (`grep -rn "Dirent" src test client_example`); the `satisfies Dirent` in `client.ts` is the only producer.
+Proposals:
+- Make `readAt` split `[offset, offset + length)` into chunks and run them through `mapConcurrent`, as `writeAll` already does.
+  That helps only when a caller asks for more than one chunk at once, so also:
+- Offer a way to keep several reads in flight from one handle without the caller managing it: either `readMany(ranges)`, or a
+  sequential read-ahead stream on a `StorageHandle`. `readStream.ts` already has the machinery (`concurrency`, default 4, max 8);
+  expose it for storage handles.
+- Document that `StorageHandle` calls are independent and may be issued concurrently, with a recommended depth of 4–8.
 
-### A2. Make the mapping a pure function and use it
+`smb2` does the equivalent in `client/read_ahead.rs`.
 
-`src/open/readdir.ts` already owns `DirEntry` handling. Add next to `readdirAll`:
+### 2. Writes only overlap within one call (medium)
 
-```ts
-import { FileAttribute } from "../wire/structs/create.js";
-import { smbTimeToDate } from "../paths.js";
-import type { Dirent } from "../types.js";
+`writeAll` pipelines 4 WRITEs, but a 1 MiB block with `MAX_IO_SIZE = 1 MiB` is a single request, so a caller writing blocks in
+sequence has one WRITE in flight. This did not change upload speed on this share (7.4 → 8.6 MiB/s going from 1 to 8 concurrent writes),
+so the priority is medium: worth doing for symmetry with reads, not worth measuring until a faster-writing server is available.
+`smb2` keeps a push-based writer (`write_pipe.rs`) that accepts bytes and sends as the credit window allows.
 
-/** Lists never throw for one oversized entry (unlike `metaToStat`): clamp instead. */
-function endOfFileToNumber(eof: bigint): number {
-  return eof > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(eof);
-}
+### 3. Credit window starts at one request and asks for 64 (medium)
 
-export function direntFromEntry(e: DirEntry): Dirent {
-  const isDir = (e.fileAttributes & FileAttribute.DIRECTORY) !== 0;
-  return {
-    name: e.fileName,
-    isFile: () => !isDir,
-    isDirectory: () => isDir,
-    size: endOfFileToNumber(e.endOfFile),
-    mtime: smbTimeToDate(e.lastWriteTime),
-    ctime: smbTimeToDate(e.creationTime),
-  };
-}
-```
+`connection.ts`: `TARGET_CREDITS = 64`; `maxIoSize` caps a request at `peakCredits × 64 KiB`, and `peakCredits` starts at 1. A new
+connection therefore sends 64 KiB requests until grants grow. `smb2` asks the server for a 512-credit window on every request
+(`CREDIT_TARGET` in `credits.rs`) and charges requests by `ceil(bytes / 64 KiB)`. Observed `peakCredits` was 64 with one request in
+flight and 160 with four or more, so this server grants more than 64 when asked.
 
-`src/client.ts`: replace the inline `entries.map(...)` body with `return entries.map(direntFromEntry);` and import it from `./open/readdir.js`. If `FileAttribute` and `Dirent` are no longer used elsewhere in `client.ts`, drop the unused imports (lint will say). Keep the `string[]` branch (`entries.map((e) => e.fileName)`) untouched.
+Proposals: raise `TARGET_CREDITS` (512 is what smb2 uses; servers clamp it, so asking high is safe), and consider raising `MAX_IO_SIZE`
+above 1 MiB when the server's `maxReadSize` and `maxWriteSize` allow it (this share advertises 8 MiB). A 4 MiB request with four in
+flight was not faster than 1 MiB (42.7 vs 48.9 MiB/s), so depth matters more than size here.
 
-Rules:
+### 4. Fixed depth versus a window sized to the link (low)
 
-1. **Reuse `smbTimeToDate`**; do not add another FILETIME conversion.
-2. **Do not throw for a huge size** (clamp, as above). Leave `metaToStat`/`stat` behaviour alone.
-3. **Zero FILETIME stays `new Date(0)`** (existing `smbTimeToDate` behaviour, consistent with `stat`). It cannot be told apart from a real 1970 timestamp; document it and let consumers treat epoch 0 as unknown (fand does, Part B).
-4. No change to `readdirAll`, paging, signing/encryption or the continuation-name workaround. No extra requests.
+`smb2` sizes its in-flight window from the measured rate times (RTT + a learned headroom), per direction, and caps it. Its source
+explains why: before 0.25 it kept up to 32 WRITEs in flight, and a `stat` on the same connection waited behind all of them (23 s on
+a 375 KB/s uplink). On this link a fixed depth of 8 already reaches the link rate, so a fixed depth is enough for now. Whatever
+depth is chosen, bound the bytes in flight, because a deep queue delays everything else on the connection (listings, stat,
+cancel).
 
-### A3. Tests (items 1-5 in `test/unit`, run by `npm test`; item 6 is integration)
+### 5. Compound requests for small files (low to medium)
 
-1. **`test/unit/wire/structs/queryDirectory.test.ts`**: add a case to the class-3 test (or a new one) that writes non-zero `creationTime`, `lastWriteTime`, `changeTime`, `endOfFile` for two chained entries and asserts every field of the parsed `DirEntry`, so the time offsets are pinned down (today only names and EOF are asserted).
-2. **`test/unit/open/readdir.test.ts`**: add a new `describe("direntFromEntry")`:
-   - a file `DirEntry` (attributes `0x80`) gives `isFile() === true`, `isDirectory() === false`, `size` equal to the bigint as a number, `mtime`/`ctime` equal to the expected `Date`s;
-   - a directory (`0x10`) gives `isDirectory() === true`;
-   - `creationTime: 0n` gives `ctime.getTime() === 0`;
-   - `endOfFile: 2n ** 60n` gives `size === Number.MAX_SAFE_INTEGER` and does not throw.
-   Build the expected FILETIME in the test, e.g. `(BigInt(Date.UTC(2024, 0, 2, 3, 4, 5)) + 11644473600000n) * 10000n`.
-3. **`test/unit/open/readdir.test.ts`**, optionally: extend the local `dirEntry()` helper with optional size/time arguments (default zeros, so existing tests are unaffected) and add one `readdirAll` test proving the values survive paging.
-4. **`test/unit/paths.test.ts`**: add `smbTimeToDate` tests: `0n` returns epoch 0; `116444736000000000n` (1970-01-01 in FILETIME) returns epoch 0; the `Date.UTC(2024, ...)` value above round-trips.
-5. **`test/unit/client.readdir-shape.test.ts`**: leave as is.
-6. **`test/integration/crud.test.ts`** (runs only against a real share via `integrationGate`): add `readdir withFileTypes returns size and times`: write a file with known bytes, `readdir(base, { withFileTypes: true })`, find it, assert `size` equals the byte length, `mtime` is within a few seconds of now, and `ctime` is a valid `Date`. Follow the file's existing create/cleanup pattern.
+`smb2` combines CREATE+READ+CLOSE in one round trip, and also stat, rename and delete. smb3-client sends these separately. In the
+storage-level benchmark direct small-file transfers were already faster than the mount (16 × 4 KiB uploads: 0.21 s direct, 0.79 s
+mounted), so the gain would show up in directory trees of many small files rather than in the large-file numbers. Measure per-file
+cost with a larger file count before building it.
 
-### A4. Docs and example
+### 6. Request timeout behaviour (low)
 
-- `README.md` (`readdir` section, around line 160): change "Pass `{ withFileTypes: true }` to get `Dirent` objects with `isFile()` and `isDirectory()` methods" to also list `size`, `mtime` and `ctime`, with the notes that directory sizes are usually 0 and that a zero creation time reads as the Unix epoch. Add a one-line mention that no extra requests are made.
-- `client_example/05-list-directory.ts` (the `withFileTypes` loop): print `size` and `mtime` too.
-- `docs/superpowers/specs/2026-05-09-node-smb3-client-design.md` (line ~335, the `Dirent` interface): update it to match, or leave if you treat that file as a frozen historical spec.
-- `package.json` version: bump a minor if you tag releases; fand pins by SHA, so the version is cosmetic.
+One direct upload failed with `SmbProtocolError: SMB request timed out` (`ETIMEDOUT`) in the benchmark, whose `requestTimeout` was
+10 s, during a slow flush window on the server. Consider measuring the timeout from the last answer received on the connection
+rather than per request, so a slow but progressing server is not treated as dead, and make the error say how long it waited and
+how many requests were outstanding.
 
-### A5. Verify, push, hand over the SHA
+## What smb3-client already does better than smb2, for this use
 
-1. `npm run verify` (typecheck, lint, unit tests) must be green; `npm run test:integration` against a real share if you have one configured.
-2. Prove the consumer path works: in a scratch directory, `npm install /Users/af4766/repos/smb3-client` (or the git URL after pushing) and check `node_modules/smb3-client/dist/types.d.ts` has `size`, `mtime` and `ctime` on `Dirent` (this exercises `prepare`).
-3. Manually list one real folder on each server you use (Synology/Samba, macOS share, Windows) and compare `size`/`mtime`/`ctime` with Finder or `ls -l`. Differences that are not bugs: FAT/exFAT shares may report a zero creation time; some servers report 0 for directory sizes.
-4. Commit and push to `ClintH/smb3-client`. **Give me the full commit SHA.**
+The README and source of `smb2` document none of these for its public API, and blocktransfer's storage layer depends on them:
+exclusive create, truncate (end-of-file), a no-replace rename (`rename(path, replaceIfExists = false)`), a stable file identity from
+`stat` on a persistent handle, and server-held handles used as write locks. Keep them when changing anything above.
 
-## Part B: fand (after A is pushed)
+## Not worth copying yet
 
-Executed in this repo once you give me the SHA.
+- smb2's learned headroom estimator (`tuning.rs`, about 100 lines of tunables) before depth 4–8 is shown insufficient.
+- Multi-channel, DFS and durable-handle reconnection: not needed by blocktransfer, and `smb2` itself lists multi-channel as a gap.
+- Anything that targets uploads, until a server with faster writes is available to measure against.
 
-1. `packages/plugin-fs-smb/package.json`: change the pin to `github:ClintH/smb3-client#<new sha>`; update `pnpm-workspace.yaml` (`allowBuilds` key contains the old SHA) to the new one; `pnpm install`.
-2. `packages/plugin-fs-smb/src/traversable-provider.ts` (children listing, currently `records: fsEntryRecords({ name: childName })`): pass `size` (files only), `modifiedMs: entry.mtime.getTime()` and `createdMs: entry.ctime.getTime()`. Treat a time of `0` (epoch) as unknown and leave the field out, so a FAT share does not show "1 Jan 1970".
-3. Keep directories' `size` undefined (the lister already shows `--` for them, but the record should not claim a size).
-4. Use the same millisecond values for the `revision` token of the child (currently `child:${childName}`), e.g. `mtime:${ms}:${size}`, so a changed file invalidates the cached listing. Check `docs/providers/cache.md` and the SMB tests for anything that asserts the old string.
-5. Tests: extend the SMB provider children test with a fake client returning the new `Dirent` fields: file with size/mtime/ctime, directory (no size), zero creation time (no `createdMs`). Conformance (`createFakeFs...`-style) already requires a valid named record; keep that passing.
-6. Docs: update `docs/providers` SMB notes and delete the "SMB listings have no size or times; blocked on `smb3-client`" item from `plans/concepts-review.md`.
-7. Check: `pnpm run typecheck`, `pnpm run lint:fix`, then `pnpm exec vitest run` in `packages/plugin-fs-smb`.
+## How to reproduce
 
-## Out of scope
+- smb2 CLI: `brew install vdavid/tap/smb2`, then `SMB2_USER=… SMB2_PASS=… smb2 put FILE //host/share/dir/FILE` and `smb2 get`.
+- Concurrency and encryption probe: open a remote file with `client.openStorage(path, { read: true })`, then issue `handle.read(offset,
+  1 MiB)` calls with 1, 4 and 8 workers sharing a counter; repeat with `encryption: 'disabled'`. The scripts used here were kept
+  outside the repository and are not part of this change.
+- Existing harness: `npm run bench:smb-access -- --volume /Volumes/Temp --url smb://ch@igloo.local/temp --layers io --mib 256`. It
+  reads and writes one 1 MiB block at a time, so it measures the sequential case only. Its first-run report is
+  `benchmarks/results/smb-access-baseline-0.2.1.md` (the direct arm hit the timeout above on one upload, so the run is marked failed;
+  25 trials were valid).
 
-- `statBig()` / bigint sizes for listings. A clamp is enough for any real file.
-- `atime` and `changeTime` on `Dirent`.
-- Entry-record deferral by subscription intensity: unnecessary because the values arrive with the listing (see `plans/concepts-review.md`).
-- Any change to paging, signing, encryption or the continuation-name workaround in `readdirAll`.
+## Limits of this evidence
 
-## Done when
+One share, one network, 2–3 runs per cell, and server write speed that varied between sessions (our earlier `cp` upload took 12.6 s for
+256 MiB, later 34–39 s). Read numbers were stable within about 10%. Direct-client numbers use the installed 0.2.2 build, not the fork's
+uncommitted working tree. Nothing was changed in `smb3-client`, so the "after" measurement the plan called for has not been done.
 
-- `client.readdir(p, { withFileTypes: true })` returns `size`, `mtime` and `ctime` with no additional requests, and the string form is unchanged.
-- Unit tests cover the parser, the mapping, the zero-time case and the size clamp; `npm run verify` is green.
-- fand lists an SMB folder in the GUI with Size and Modified columns filled for files.
+## Companion change in blocktransfer (not upstream)
+
+The engine awaits each 1 MiB block before issuing the next (`src/core.ts` byte loop and the local-stores range copy), so even a fixed
+client would see one request in flight. Blocktransfer needs read-ahead of its own, for example a bounded queue of 4–8 outstanding
+`source.read` calls, hashing and writing in order. That change belongs in this repository, and it applies to the mount as well as to
+direct SMB.

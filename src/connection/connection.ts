@@ -17,6 +17,7 @@ import {
 import { encodeNegotiateRequest, decodeNegotiateResponse, NegotiateResponse } from "../wire/structs/negotiate.js";
 import { encodeCancelRequest } from "../wire/structs/cancel.js";
 import { CreditWindow } from "./credits.js";
+import { createByteBudget } from "./byteBudget.js";
 import { PreauthHash } from "./preauth.js";
 import { type Encryptor, isTransformHeader } from "./encryption.js";
 import { SmbProtocolError } from "../errors.js";
@@ -57,7 +58,9 @@ export const CREDIT_UNIT = 65536;
 /** Largest single READ/WRITE we issue, even if the server allows more (matches Linux cifs). */
 const MAX_IO_SIZE = 1 << 20;
 /** Credit window we try to keep open with the server; it may grant less. */
-const TARGET_CREDITS = 64;
+const TARGET_CREDITS = 512;
+/** READ/WRITE payload bytes allowed in flight on one connection at once. */
+const MAX_INFLIGHT_BYTES = 8 << 20;
 
 /** Number of credits a READ/WRITE payload of `bytes` consumes. */
 export function creditChargeFor(bytes: number): number {
@@ -92,6 +95,11 @@ export class Connection extends EventEmitter {
   private encryptor: Encryptor | null = null;
   private encryptionRequired = false;
   private signingRequired = false;
+  private readonly ioBudget = createByteBudget(MAX_INFLIGHT_BYTES);
+  /** Requests (or compounds) awaiting a response, for the idle watchdog. */
+  private outstanding = 0;
+  private lastActivity = Date.now();
+  private watchdog: NodeJS.Timeout | undefined;
 
   constructor(private readonly transport: Transport, private readonly options: { requestTimeoutMs?: number } = {}) {
     super();
@@ -162,90 +170,156 @@ export class Connection extends EventEmitter {
   }
 
   async send(command: number, body: Buffer, opts: SendOptions = {}): Promise<{ header: SmbHeader; body: Buffer }> {
-    const timeout = this.options.requestTimeoutMs ?? 0;
-    if (!timeout || command === SmbCommand.CHANGE_NOTIFY) return this.sendRequest(command, body, opts);
-    const timer = setTimeout(() => {
-      const error = Object.assign(new SmbProtocolError({ status: 0, message: "SMB request timed out" }), { code: "ETIMEDOUT" });
-      this.abortConnection(error);
-    }, timeout);
-    timer.unref();
-    try { return await this.sendRequest(command, body, opts); }
-    finally { clearTimeout(timer); }
+    const [response] = await this.track(command !== SmbCommand.CHANGE_NOTIFY, () =>
+      this.dispatch([{ command, body, charge: opts.creditCharge ?? 1, flags: opts.flags ?? 0 }], opts));
+    return response!;
   }
 
-  private async sendRequest(
-    command: number,
-    body: Buffer,
-    opts: SendOptions = {},
-  ): Promise<{ header: SmbHeader; body: Buffer }> {
-    if (this.closed) throw new SmbProtocolError({ status: 0, message: "connection closed" });
-    const charge = opts.creditCharge ?? 1;
-    if (charge > 0) await this.credits.take(charge);
-    if (this.closed) throw new SmbProtocolError({ status: 0, message: "connection closed" });
-    // A multi-credit request occupies CreditCharge consecutive message IDs
-    // (MS-SMB2 §3.2.4.1.3); the header carries the first.
-    const messageId = this.nextMessageId;
-    this.nextMessageId += BigInt(Math.max(1, charge));
-    this.inflightCharge += charge;
+  /**
+   * Sends several commands as one compound request (MS-SMB2 §3.2.4.1.4) in one
+   * round trip. Commands after the first are "related": they inherit the previous
+   * command's FileId when their body carries the 0xFF.. sentinel. Responses are
+   * returned in request order, however the server frames them.
+   */
+  async sendCompound(
+    items: readonly { command: number; body: Buffer; creditCharge?: number }[],
+    opts: Omit<SendOptions, "creditCharge" | "flags"> = {},
+  ): Promise<{ header: SmbHeader; body: Buffer }[]> {
+    const prepared = items.map((item, i) => ({
+      command: item.command,
+      body: item.body,
+      charge: item.creditCharge ?? 1,
+      flags: i > 0 ? HeaderFlag.RELATED_OPERATIONS : 0,
+    }));
+    return this.track(true, () => this.dispatch(prepared, opts));
+  }
+
+  /** True when the credits we have seen granted can cover a compound of `totalCharge` credits. */
+  canCompound(totalCharge: number): boolean {
+    return !this.closed && this.peakCredits >= totalCharge;
+  }
+
+  /**
+   * Runs `fn` once `bytes` of READ/WRITE payload fit in the connection-wide
+   * in-flight budget. Bounding queued bytes keeps small requests (stat, listings,
+   * cancel) from waiting behind a deep queue of bulk transfers.
+   */
+  withIoBudget<T>(bytes: number, fn: () => Promise<T>): Promise<T> {
+    return this.ioBudget.run(bytes, fn);
+  }
+
+  /**
+   * Idle watchdog: the connection is declared dead only when requests are
+   * outstanding and nothing at all has been received for the timeout. A slow but
+   * progressing server therefore never trips it, whatever the queue depth.
+   */
+  private async track<T>(watched: boolean, run: () => Promise<T>): Promise<T> {
+    const timeout = this.options.requestTimeoutMs ?? 0;
+    if (!timeout || !watched) return run();
+    if (this.outstanding++ === 0) this.lastActivity = Date.now();
+    this.armWatchdog(timeout, timeout);
+    try { return await run(); }
+    finally {
+      if (--this.outstanding === 0 && this.watchdog !== undefined) {
+        clearTimeout(this.watchdog);
+        this.watchdog = undefined;
+      }
+    }
+  }
+
+  private armWatchdog(timeout: number, delay: number): void {
+    if (this.watchdog !== undefined) return;
+    this.watchdog = setTimeout(() => {
+      this.watchdog = undefined;
+      if (this.outstanding === 0) return;
+      const idle = Date.now() - this.lastActivity;
+      if (idle < timeout) { this.armWatchdog(timeout, timeout - idle); return; }
+      const message = `SMB request timed out: nothing received for ${idle} ms with ${this.outstanding} request(s) outstanding (limit ${timeout} ms)`;
+      this.abortConnection(Object.assign(new SmbProtocolError({ status: 0, message }), { code: "ETIMEDOUT" }));
+    }, delay);
+    this.watchdog.unref();
+  }
+
+  private creditRequestFor(charge: number): number {
     // Ask for enough credits to bring our window back up to TARGET_CREDITS once
     // this request completes; this is what lets several requests overlap.
-    const creditRequest = Math.min(
-      0xffff,
-      Math.max(1, TARGET_CREDITS - (this.credits.available() + this.inflightCharge) + charge),
-    );
-    const flags = opts.flags ?? 0;
-    const wantEncrypt = opts.encrypt === true && this.encryptor !== null;
+    return Math.min(0xffff, Math.max(1, TARGET_CREDITS - (this.credits.available() + this.inflightCharge) + charge));
+  }
 
-    let header = encodeHeader({
-      command,
-      creditCharge: charge,
-      creditRequestResponse: creditRequest,
-      flags,
-      messageId,
+  /**
+   * Encodes one command of a (possibly compound) message. All but the last
+   * command are padded to 8 bytes and carry NextCommand; each is signed on its own.
+   */
+  private buildSegment(
+    s: { command: number; body: Buffer; charge: number; flags: number; messageId: bigint; creditRequest: number },
+    opts: SendOptions,
+    sign: boolean,
+    hasNext: boolean,
+  ): Buffer {
+    const raw = SMB2_HEADER_SIZE + s.body.length;
+    const length = hasNext ? Math.ceil(raw / 8) * 8 : raw;
+    const header = encodeHeader({
+      command: s.command,
+      creditCharge: s.charge,
+      creditRequestResponse: s.creditRequest,
+      flags: s.flags | (sign ? HeaderFlag.SIGNED : 0),
+      messageId: s.messageId,
       sessionId: opts.sessionId ?? 0n,
       treeId: opts.treeId ?? 0,
       status: 0,
+      ...(hasNext ? { nextCommand: length } : {}),
     });
-    let frameBuf = Buffer.concat([header, body]);
+    const segment = Buffer.concat([header, s.body, Buffer.alloc(length - raw)]);
+    if (sign) opts.signing!.sign(segment).copy(segment, 48); // signature offset within header is 48
+    return segment;
+  }
+
+  private async dispatch(
+    items: readonly { command: number; body: Buffer; charge: number; flags: number }[],
+    opts: SendOptions,
+  ): Promise<{ header: SmbHeader; body: Buffer }[]> {
+    if (this.closed) throw new SmbProtocolError({ status: 0, message: "connection closed" });
+    const total = items.reduce((n, item) => n + item.charge, 0);
+    if (total > 0) await this.credits.take(total);
+    if (this.closed) throw new SmbProtocolError({ status: 0, message: "connection closed" });
+    const wantEncrypt = opts.encrypt === true && this.encryptor !== null;
     // Encryption supersedes signing for the same PDU (MS-SMB2 §3.1.4.3): the inner
     // SMB2 header is left unsigned and the TRANSFORM_HEADER's auth tag covers integrity.
-    if (opts.signing && !wantEncrypt) {
-      const signedFlags = flags | HeaderFlag.SIGNED;
-      header = encodeHeader({
-        command,
-        creditCharge: charge,
-        creditRequestResponse: creditRequest,
-        flags: signedFlags,
-        messageId,
-        sessionId: opts.sessionId ?? 0n,
-        treeId: opts.treeId ?? 0,
-        status: 0,
-      });
-      frameBuf = Buffer.concat([header, body]);
-      const sig = opts.signing.sign(frameBuf);
-      sig.copy(frameBuf, 48); // signature offset within header is 48
-    }
+    const sign = opts.signing !== undefined && !wantEncrypt;
 
-    // Pre-auth hash always feeds on the plaintext PDU. NEGOTIATE and the first
-    // SESSION_SETUP can't be encrypted (no keys yet), so this branch only ever
-    // sees plaintext for those commands in practice.
-    if (command === SmbCommand.NEGOTIATE || command === SmbCommand.SESSION_SETUP) {
-      this.preauth.update(frameBuf);
-    }
-
-    const promise = new Promise<{ header: SmbHeader; body: Buffer }>((resolve, reject) => {
-      this.pendingByMessageId.set(messageId.toString(), {
-        resolve,
-        reject,
-        charge,
-        expectsAsync: command === SmbCommand.CHANGE_NOTIFY,
-        encrypted: wantEncrypt,
-      });
+    const segments: Buffer[] = [];
+    const promises: Promise<{ header: SmbHeader; body: Buffer }>[] = [];
+    items.forEach((item, i) => {
+      // A multi-credit request occupies CreditCharge consecutive message IDs
+      // (MS-SMB2 §3.2.4.1.3); the header carries the first.
+      const messageId = this.nextMessageId;
+      this.nextMessageId += BigInt(Math.max(1, item.charge));
+      this.inflightCharge += item.charge;
+      const segment = this.buildSegment(
+        { ...item, messageId, creditRequest: this.creditRequestFor(item.charge) },
+        opts, sign, i < items.length - 1,
+      );
+      // Pre-auth hash always feeds on the plaintext PDU. NEGOTIATE and the first
+      // SESSION_SETUP can't be encrypted (no keys yet).
+      if (item.command === SmbCommand.NEGOTIATE || item.command === SmbCommand.SESSION_SETUP) {
+        this.preauth.update(segment);
+      }
+      segments.push(segment);
+      promises.push(new Promise((resolve, reject) => {
+        this.pendingByMessageId.set(messageId.toString(), {
+          resolve,
+          reject,
+          charge: item.charge,
+          expectsAsync: item.command === SmbCommand.CHANGE_NOTIFY,
+          encrypted: wantEncrypt,
+        });
+      }));
     });
-    const wire = wantEncrypt ? this.encryptor!.encrypt(frameBuf) : frameBuf;
+    const message = segments.length === 1 ? segments[0]! : Buffer.concat(segments);
+    const wire = wantEncrypt ? this.encryptor!.encrypt(message) : message;
     try { this.transport.send(makeFrame(wire)); }
     catch { this.abortConnection(new SmbProtocolError({ status: 0, message: "transport send failed" })); }
-    return promise;
+    return Promise.all(promises);
   }
 
   preauthDigest(): Buffer {
@@ -275,6 +349,7 @@ export class Connection extends EventEmitter {
   }
 
   private onMessage(raw: Buffer): void {
+    this.lastActivity = Date.now();
     let msg = raw;
     let wasEncrypted = false;
     if (isTransformHeader(raw)) {
@@ -291,6 +366,18 @@ export class Connection extends EventEmitter {
         return;
       }
     }
+    // A compound response chains several SMB2 messages through NextCommand.
+    let offset = 0;
+    while (offset < msg.length) {
+      const next = msg.length - offset >= SMB2_HEADER_SIZE ? msg.readUInt32LE(offset + 20) : 0;
+      const end = next > 0 && offset + next <= msg.length ? offset + next : msg.length;
+      this.handleMessage(msg.subarray(offset, end), wasEncrypted);
+      if (end === msg.length || next === 0) break;
+      offset = end;
+    }
+  }
+
+  private handleMessage(msg: Buffer, wasEncrypted: boolean): void {
     let parsed: ReturnType<typeof decodeHeader>;
     try {
       parsed = decodeHeader(msg);

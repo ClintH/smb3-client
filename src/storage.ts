@@ -1,6 +1,7 @@
 import type { Open } from './open/open.js';
-import { readAt } from './open/read.js';
+import { readAt, readMany } from './open/read.js';
 import { writeAll } from './open/write.js';
+import { createWritePipe, type WritePipe } from './open/writePipe.js';
 import { metaToStat } from './open/query.js';
 import { SmbCommand, isSuccess, statusName } from './wire/commands.js';
 import { SmbError } from './errors.js';
@@ -65,9 +66,30 @@ export class StorageHandle {
     return readAt(this.open, BigInt(position), length);
   }
 
+  /**
+   * Reads several ranges concurrently (bounded depth). Handle calls are independent and
+   * may also be issued concurrently by the caller; a depth of 4-8 is recommended.
+   */
+  async readMany(ranges: readonly { position: number; length: number }[]): Promise<Buffer[]> {
+    for (const r of ranges) {
+      if (!Number.isSafeInteger(r.position) || r.position < 0 || !Number.isSafeInteger(r.length) || r.length < 0) throw new RangeError('Invalid read range.');
+    }
+    return readMany(this.open, ranges.map(r => ({ offset: BigInt(r.position), length: r.length })));
+  }
+
   async write(position: number, data: Buffer): Promise<void> {
     if (!Number.isSafeInteger(position) || position < 0 || !Number.isSafeInteger(position + data.length)) throw new RangeError('Invalid write range.');
     await writeAll(this.open, BigInt(position), data);
+  }
+
+  /**
+   * Push-based sequential writer starting at `position`: `write` returns once the data is
+   * in flight, keeping several WRITEs outstanding; `flush` waits for all of them. Call
+   * `sync` afterwards for durability.
+   */
+  writePipe(position: number): WritePipe {
+    if (!Number.isSafeInteger(position) || position < 0) throw new RangeError('Invalid write range.');
+    return createWritePipe(this.open, BigInt(position));
   }
 
   async sync(): Promise<void> {

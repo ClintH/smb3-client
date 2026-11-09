@@ -6,8 +6,8 @@ import { creditChargeFor } from "../connection/connection.js";
 import { mapConcurrent, planRanges } from "./pool.js";
 
 const DEFAULT_MAX_WRITE = 1 << 16; // 64 KiB, the only size every server must accept
-/** Concurrent WRITEs issued by writeAll. */
-const WRITE_CONCURRENCY = 4;
+/** Concurrent WRITEs issued per call; the connection-wide byte budget bounds the total. */
+const WRITE_CONCURRENCY = 8;
 
 /** Bytes per WRITE request on this connection (see Connection.maxIoSize). */
 export function writeChunkSize(open: Open): number {
@@ -16,7 +16,11 @@ export function writeChunkSize(open: Open): number {
 }
 
 /** One SMB2 WRITE; resolves to the byte count the server accepted (may be less than `data.length`). */
-async function writeOnce(open: Open, offset: bigint, data: Buffer): Promise<number> {
+function writeOnce(open: Open, offset: bigint, data: Buffer): Promise<number> {
+  return open.tree.conn.withIoBudget(data.length, () => writeOnceUnbudgeted(open, offset, data));
+}
+
+async function writeOnceUnbudgeted(open: Open, offset: bigint, data: Buffer): Promise<number> {
   const body = encodeWriteRequest({ fileId: open.fileId, offset, data });
   const signing = open.tree.session.makeSigning();
   const resp = await open.tree.conn.send(SmbCommand.WRITE, body, {

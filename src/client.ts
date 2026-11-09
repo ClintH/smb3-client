@@ -4,9 +4,7 @@ import { Connection } from "./connection/connection.js";
 import { Session } from "./session/session.js";
 import { Tree } from "./tree/tree.js";
 import { Open } from "./open/open.js";
-import { readAll, readAt } from "./open/read.js";
-import { writeAll } from "./open/write.js";
-import { metaToStat } from "./open/query.js";
+import { statPath, mkdirPath, deletePathCompound, renamePath, readFilePath, readRangePath, writePath } from "./open/oneShot.js";
 import { readdirAll, direntFromEntry } from "./open/readdir.js";
 import { createReadStream as openCreateReadStream } from "./open/readStream.js";
 import { createWriteStream as openCreateWriteStream } from "./open/writeStream.js";
@@ -19,8 +17,6 @@ import {
 } from "./wire/structs/create.js";
 import { splitSharePath, toSmbPath } from "./paths.js";
 import type { ClientOptions, Dirent, FileStat, ChangeEvent, ShareInfo } from "./types.js";
-import { encodeSetInfoRequest, encodeFileRenameInformation, encodeFileDispositionInformation } from "./wire/structs/setInfo.js";
-import { InfoType, FileInformationClass } from "./wire/structs/queryInfo.js";
 import { SmbCommand, Cipher, Capability, SecurityMode, isSuccess, statusName } from "./wire/commands.js";
 import { SmbError } from "./errors.js";
 import { encodeWriteRequest, decodeWriteResponse } from "./wire/structs/write.js";
@@ -97,31 +93,15 @@ export class Client {
   async readFile(path: string, encoding?: BufferEncoding): Promise<Buffer | string> {
     const { share, rest } = splitSharePath(path);
     const tree = await this.treeFor(share);
-    return Open.withOpen(tree, {
-      filename: toSmbPath(rest),
-      desiredAccess: FileAccess.FILE_READ_DATA | FileAccess.FILE_READ_ATTRIBUTES,
-      shareAccess: ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE,
-      createDisposition: CreateDisposition.OPEN,
-      createOptions: CreateOptions.NON_DIRECTORY_FILE,
-      fileAttributes: 0,
-    }, async (open) => {
-      const buf = await readAll(open, open.meta.endOfFile);
-      return encoding ? buf.toString(encoding) : buf;
-    });
+    const buf = await readFilePath(tree, toSmbPath(rest));
+    return encoding ? buf.toString(encoding) : buf;
   }
 
   async writeFile(path: string, data: Buffer | string, encoding: BufferEncoding = "utf8"): Promise<void> {
     const buf = typeof data === "string" ? Buffer.from(data, encoding) : data;
     const { share, rest } = splitSharePath(path);
     const tree = await this.treeFor(share);
-    await Open.withOpen(tree, {
-      filename: toSmbPath(rest),
-      desiredAccess: FileAccess.GENERIC_WRITE | FileAccess.FILE_READ_ATTRIBUTES,
-      shareAccess: ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE,
-      createDisposition: CreateDisposition.OVERWRITE_IF,
-      createOptions: CreateOptions.NON_DIRECTORY_FILE,
-      fileAttributes: 0,
-    }, async (open) => writeAll(open, 0n, buf));
+    await writePath(tree, toSmbPath(rest), 0, buf, CreateDisposition.OVERWRITE_IF);
   }
 
   /**
@@ -135,18 +115,7 @@ export class Client {
     if (length === 0) return Buffer.alloc(0);
     const { share, rest } = splitSharePath(path);
     const tree = await this.treeFor(share);
-    return Open.withOpen(tree, {
-      filename: toSmbPath(rest),
-      desiredAccess: FileAccess.FILE_READ_DATA | FileAccess.FILE_READ_ATTRIBUTES,
-      shareAccess: ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE,
-      createDisposition: CreateDisposition.OPEN,
-      createOptions: CreateOptions.NON_DIRECTORY_FILE,
-      fileAttributes: 0,
-    }, async (open) => {
-      const max = Number(open.meta.endOfFile) - offset;
-      if (max <= 0) return Buffer.alloc(0);
-      return readAt(open, BigInt(offset), Math.min(length, max));
-    });
+    return readRangePath(tree, toSmbPath(rest), offset, length);
   }
 
   /**
@@ -159,14 +128,7 @@ export class Client {
       throw new RangeError("writeRange: offset must be a non-negative safe integer");
     const { share, rest } = splitSharePath(path);
     const tree = await this.treeFor(share);
-    await Open.withOpen(tree, {
-      filename: toSmbPath(rest),
-      desiredAccess: FileAccess.GENERIC_WRITE | FileAccess.FILE_READ_ATTRIBUTES,
-      shareAccess: ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE,
-      createDisposition: CreateDisposition.OPEN_IF,
-      createOptions: CreateOptions.NON_DIRECTORY_FILE,
-      fileAttributes: 0,
-    }, async (open) => writeAll(open, BigInt(offset), data));
+    await writePath(tree, toSmbPath(rest), offset, data, CreateDisposition.OPEN_IF);
   }
 
   async readdir(path: string): Promise<string[]>;
@@ -222,27 +184,13 @@ export class Client {
   async stat(path: string): Promise<FileStat> {
     const { share, rest } = splitSharePath(path);
     const tree = await this.treeFor(share);
-    return Open.withOpen(tree, {
-      filename: toSmbPath(rest),
-      desiredAccess: FileAccess.FILE_READ_ATTRIBUTES,
-      shareAccess: ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE,
-      createDisposition: CreateDisposition.OPEN,
-      createOptions: 0,
-      fileAttributes: 0,
-    }, async (open) => metaToStat(open.meta));
+    return statPath(tree, toSmbPath(rest));
   }
 
   async mkdir(path: string): Promise<void> {
     const { share, rest } = splitSharePath(path);
     const tree = await this.treeFor(share);
-    await Open.withOpen(tree, {
-      filename: toSmbPath(rest),
-      desiredAccess: FileAccess.FILE_READ_ATTRIBUTES | FileAccess.FILE_WRITE_ATTRIBUTES,
-      shareAccess: ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE,
-      createDisposition: CreateDisposition.CREATE,
-      createOptions: 1, // DIRECTORY_FILE
-      fileAttributes: 0,
-    }, async () => undefined);
+    await mkdirPath(tree, toSmbPath(rest));
   }
 
   async rm(path: string): Promise<void> {
@@ -262,35 +210,7 @@ export class Client {
   private async deletePath(path: string, kind: number): Promise<void> {
     const { share, rest } = splitSharePath(path);
     const tree = await this.treeFor(share);
-    await Open.withOpen(tree, {
-      filename: toSmbPath(rest),
-      desiredAccess: FileAccess.DELETE,
-      shareAccess: ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE,
-      createDisposition: CreateDisposition.OPEN,
-      createOptions: kind,
-      fileAttributes: 0,
-    }, async (open) => {
-      const body = encodeSetInfoRequest({
-        infoType: InfoType.FILE,
-        fileInformationClass: FileInformationClass.FileDispositionInformation,
-        fileId: open.fileId,
-        buffer: encodeFileDispositionInformation(true),
-      });
-      const signing = tree.session.makeSigning();
-      const resp = await tree.conn.send(SmbCommand.SET_INFO, body, {
-        sessionId: tree.session.sessionId,
-        treeId: tree.treeId,
-        ...(signing !== undefined ? { signing } : {}),
-        encrypt: tree.encryptRequired,
-        creditCharge: 1,
-      });
-      if (!isSuccess(resp.header.status)) {
-        throw new SmbError({
-          status: resp.header.status,
-          message: `SET_INFO delete failed: ${statusName(resp.header.status)}`,
-        });
-      }
-    });
+    await deletePathCompound(tree, toSmbPath(rest), kind);
   }
 
   async rename(from: string, to: string): Promise<void> {
@@ -300,39 +220,7 @@ export class Client {
       throw new SmbError({ status: 0, message: "rename across shares is not supported" });
     }
     const tree = await this.treeFor(f.share);
-    await Open.withOpen(tree, {
-      filename: toSmbPath(f.rest),
-      desiredAccess: FileAccess.DELETE | FileAccess.FILE_READ_ATTRIBUTES,
-      shareAccess: ShareAccess.READ | ShareAccess.WRITE | ShareAccess.DELETE,
-      createDisposition: CreateDisposition.OPEN,
-      createOptions: 0,
-      fileAttributes: 0,
-    }, async (open) => {
-      const inner = encodeFileRenameInformation({
-        replaceIfExists: false,
-        fileName: toSmbPath(t.rest),
-      });
-      const body = encodeSetInfoRequest({
-        infoType: InfoType.FILE,
-        fileInformationClass: FileInformationClass.FileRenameInformation,
-        fileId: open.fileId,
-        buffer: inner,
-      });
-      const signing = tree.session.makeSigning();
-      const resp = await tree.conn.send(SmbCommand.SET_INFO, body, {
-        sessionId: tree.session.sessionId,
-        treeId: tree.treeId,
-        ...(signing !== undefined ? { signing } : {}),
-        encrypt: tree.encryptRequired,
-        creditCharge: 1,
-      });
-      if (!isSuccess(resp.header.status)) {
-        throw new SmbError({
-          status: resp.header.status,
-          message: `SET_INFO rename failed: ${statusName(resp.header.status)}`,
-        });
-      }
-    });
+    await renamePath(tree, toSmbPath(f.rest), toSmbPath(t.rest));
   }
 
   async *watch(path: string, opts: { recursive?: boolean; signal?: AbortSignal } = {}): AsyncGenerator<ChangeEvent> {
