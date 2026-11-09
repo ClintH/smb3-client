@@ -102,6 +102,47 @@ describe("Connection inbound enforcement — signing required", () => {
     expect((failures[0] as Error).message).toMatch(/signing.*required|unsigned/i);
   });
 
+  function asyncFrame(command: number, messageId: bigint, status: number): Buffer {
+    const header = encodeHeader({
+      command, creditCharge: 1, creditRequestResponse: 1, flags: HeaderFlag.ASYNC_COMMAND,
+      messageId, asyncId: 7n, sessionId: 0n, status,
+    });
+    return Buffer.concat([header, Buffer.alloc(8)]);
+  }
+
+  it("accepts an unsigned interim STATUS_PENDING response but still rejects an unsigned final one", async () => {
+    const ft = new FakeTransport();
+    const conn = new Connection(ft);
+    injectNegotiated(conn);
+    conn.setSigningRequired(true);
+
+    const failures: unknown[] = [];
+    const pending = conn.send(SmbCommand.FLUSH, Buffer.alloc(0), { sessionId: 1n }).catch((e) => failures.push(e));
+    await new Promise((r) => setImmediate(r));
+    ft.emit("message", asyncFrame(SmbCommand.FLUSH, 0n, 0x103));
+    await new Promise((r) => setImmediate(r));
+    expect(failures).toHaveLength(0);
+    ft.emit("message", asyncFrame(SmbCommand.FLUSH, 0n, 0));
+    await pending;
+    expect(failures.length).toBeGreaterThan(0);
+    expect((failures[0] as Error).message).toMatch(/unsigned/i);
+  });
+
+  it("rejects an unsigned STATUS_PENDING response that is not marked async", async () => {
+    const ft = new FakeTransport();
+    const conn = new Connection(ft);
+    injectNegotiated(conn);
+    conn.setSigningRequired(true);
+
+    const failures: unknown[] = [];
+    const pending = conn.send(SmbCommand.FLUSH, Buffer.alloc(0), { sessionId: 1n }).catch((e) => failures.push(e));
+    await new Promise((r) => setImmediate(r));
+    const header = encodeHeader({ command: SmbCommand.FLUSH, creditCharge: 1, creditRequestResponse: 1, flags: 0, messageId: 0n, sessionId: 0n, treeId: 0, status: 0x103 });
+    ft.emit("message", Buffer.concat([header, Buffer.alloc(8)]));
+    await pending;
+    expect(failures.length).toBeGreaterThan(0);
+  });
+
   it("accepts a plaintext NEGOTIATE response when signingRequired is true (pre-auth exemption)", async () => {
     const ft = new FakeTransport();
     const conn = new Connection(ft);

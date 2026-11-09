@@ -322,7 +322,10 @@ export class Connection extends EventEmitter {
       this.signingRequired &&
       header.command !== SmbCommand.NEGOTIATE &&
       header.command !== SmbCommand.SESSION_SETUP &&
-      (header.flags & HeaderFlag.SIGNED) === 0
+      (header.flags & HeaderFlag.SIGNED) === 0 &&
+      // MS-SMB2 §3.2.5.1.1: interim STATUS_PENDING responses are never signed. They carry no data;
+      // the final response is still held to the signing requirement.
+      !(header.status === NTStatus.STATUS_PENDING && (header.flags & HeaderFlag.ASYNC_COMMAND) !== 0)
     ) {
       this.fail(new SmbProtocolError({
         status: 0,
