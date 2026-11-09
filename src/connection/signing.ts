@@ -53,12 +53,13 @@ export function aesCmac(key: Buffer, msg: Buffer): Buffer {
     for (let i = 0; i < 16; i++) lastBlock[i] = lastBlock[i]! ^ k2[i]!;
   }
 
+  // CBC with a zero IV over all but the last block is the CMAC chain; one native call instead of one per block.
   let X: Buffer = Buffer.alloc(16);
-  for (let i = 0; i < nBlocks - 1; i++) {
-    const block = msg.subarray(i * 16, i * 16 + 16);
-    const Y = Buffer.alloc(16);
-    for (let j = 0; j < 16; j++) Y[j] = X[j]! ^ block[j]!;
-    X = aesEcbEncryptBlock(key, Y);
+  if (nBlocks > 1) {
+    const c = createCipheriv("aes-128-cbc", key, Buffer.alloc(16));
+    c.setAutoPadding(false);
+    const out = c.update(msg.subarray(0, (nBlocks - 1) * 16));
+    X = out.subarray(out.length - 16);
   }
   const Y = Buffer.alloc(16);
   for (let j = 0; j < 16; j++) Y[j] = X[j]! ^ lastBlock[j]!;

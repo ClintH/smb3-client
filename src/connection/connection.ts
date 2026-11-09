@@ -326,7 +326,7 @@ export class Connection extends EventEmitter {
     ) {
       this.fail(new SmbProtocolError({
         status: 0,
-        message: "unsigned response received but signing is required",
+        message: `unsigned response received but signing is required (command ${header.command}, status 0x${(header.status >>> 0).toString(16)})`,
       }));
       return;
     }
