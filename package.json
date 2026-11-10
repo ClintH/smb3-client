@@ -1,6 +1,6 @@
 {
   "name": "@clinth/smb3-client",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "TypeScript SMB3 client for Node.js. Pure ESM, no native dependencies. fs-like promise API with streaming I/O, directory change notifications, and share enumeration. Speaks MS-SMB2 over TCP/445.",
   "keywords": [
     "smb",

@@ -49,7 +49,25 @@ export const FileAttribute = {
   ARCHIVE: 0x00000020,
   NORMAL: 0x00000080,
   TEMPORARY: 0x00000100,
+  REPARSE_POINT: 0x00000400,
 } as const;
+
+export const IO_REPARSE_TAG_MOUNT_POINT = 0xa0000003;
+export const IO_REPARSE_TAG_SYMLINK = 0xa000000c;
+
+/**
+ * Returns the reparse tag of an object, or `undefined` when it is not a
+ * reparse point. A tag is NOT stored in the SMB2 attributes bitfield: it comes
+ * from `Dirent.reparseTag` (directory listings). Pass a `Dirent`, or any
+ * `{ attributes, reparseTag? }`. A bare attributes number can only say whether
+ * the object is a reparse point, not which kind, so it yields `undefined`.
+ */
+export function reparseTagOf(
+  x: { attributes: number; reparseTag?: number | undefined },
+): number | undefined {
+  if ((x.attributes & FileAttribute.REPARSE_POINT) === 0) return undefined;
+  return x.reparseTag;
+}
 
 export interface CreateRequest {
   desiredAccess: number;

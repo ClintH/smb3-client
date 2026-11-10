@@ -5,3 +5,4 @@ export type { ClientOptions, FileStat, Dirent, ShareInfo, ChangeEvent, ChangeAct
 
 export { StorageHandle } from './storage.js';
 export type { StorageOpenOptions, StorageStat } from './storage.js';
+export { FileAttribute, IO_REPARSE_TAG_SYMLINK, IO_REPARSE_TAG_MOUNT_POINT, reparseTagOf } from './wire/structs/create.js';

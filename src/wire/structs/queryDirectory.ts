@@ -46,6 +46,8 @@ export interface DirEntry {
   fileName: string;
   endOfFile: bigint;
   fileAttributes: number;
+  /** `EaSize` field; per MS-FSCC it carries the reparse tag when FILE_ATTRIBUTE_REPARSE_POINT is set. */
+  eaSize: number;
   creationTime: bigint;
   lastAccessTime: bigint;
   lastWriteTime: bigint;
@@ -68,14 +70,14 @@ export function parseFileIdBothDirectoryInformation(buf: Buffer): DirEntry[] {
     r.u64(); // AllocationSize
     const fileAttributes = r.u32();
     const fileNameLength = r.u32();
-    r.u32(); // EaSize
+    const eaSize = r.u32();
     r.u8(); // ShortNameLength
     r.u8(); // Reserved1
     r.bytes(24); // ShortName
     r.u16(); // Reserved2
     r.bytes(8); // FileId
     const fileName = fileNameLength > 0 ? r.utf16(fileNameLength) : "";
-    out.push({ fileName, endOfFile, fileAttributes, creationTime, lastAccessTime, lastWriteTime, changeTime });
+    out.push({ fileName, endOfFile, fileAttributes, eaSize, creationTime, lastAccessTime, lastWriteTime, changeTime });
     if (next === 0) break;
     off += next;
   }
@@ -108,12 +110,12 @@ export function parseFileBothDirectoryInformation(buf: Buffer): DirEntry[] {
     r.u64(); // AllocationSize
     const fileAttributes = r.u32();
     const fileNameLength = r.u32();
-    r.u32(); // EaSize
+    const eaSize = r.u32();
     r.u8(); // ShortNameLength
     r.u8(); // Reserved1
     r.bytes(24); // ShortName
     const fileName = fileNameLength > 0 ? r.utf16(fileNameLength) : "";
-    out.push({ fileName, endOfFile, fileAttributes, creationTime, lastAccessTime, lastWriteTime, changeTime });
+    out.push({ fileName, endOfFile, fileAttributes, eaSize, creationTime, lastAccessTime, lastWriteTime, changeTime });
     if (next === 0) break;
     off += next;
   }

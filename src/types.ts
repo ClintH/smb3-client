@@ -19,6 +19,10 @@ export interface Dirent {
   isDirectory: () => boolean;
   /** Size in bytes (`EndOfFile`). Servers usually report 0 for directories. Clamped to `Number.MAX_SAFE_INTEGER`. */
   size: number;
+  /** Raw SMB2 file attributes (same meaning as `FileStat.attributes`). */
+  attributes: number;
+  /** Reparse tag (e.g. `IO_REPARSE_TAG_SYMLINK`) when `attributes` has FILE_ATTRIBUTE_REPARSE_POINT and the server reported one; else `undefined`. */
+  reparseTag?: number;
   /** Last write time. */
   mtime: Date;
   /** Creation time (same meaning as `FileStat.ctime`). A server that reports none yields `new Date(0)`. */

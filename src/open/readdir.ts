@@ -25,8 +25,11 @@ function endOfFileToNumber(eof: bigint): number {
  */
 export function direntFromEntry(e: DirEntry): Dirent {
   const isDir = (e.fileAttributes & FileAttribute.DIRECTORY) !== 0;
+  const isReparse = (e.fileAttributes & FileAttribute.REPARSE_POINT) !== 0;
   return {
     name: e.fileName,
+    attributes: e.fileAttributes,
+    ...(isReparse && e.eaSize !== 0 ? { reparseTag: e.eaSize >>> 0 } : {}),
     isFile: () => !isDir,
     isDirectory: () => isDir,
     size: endOfFileToNumber(e.endOfFile),

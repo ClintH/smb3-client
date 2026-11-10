@@ -1,3 +1,4 @@
+import { reparseTagOf, IO_REPARSE_TAG_SYMLINK, IO_REPARSE_TAG_MOUNT_POINT } from "../../../src/wire/structs/create.js";
 import { describe, it, expect } from "vitest";
 import { FakeTransport } from "../../helpers/fakeTransport.js";
 import { Connection } from "../../../src/connection/connection.js";
@@ -140,7 +141,7 @@ const toFiletime = (ms: number): bigint => (BigInt(ms) + 11644473600000n) * 1000
 
 function entryOf(over: Partial<DirEntry>): DirEntry {
   return {
-    fileName: "f", endOfFile: 0n, fileAttributes: 0x80,
+    fileName: "f", endOfFile: 0n, fileAttributes: 0x80, eaSize: 0,
     creationTime: 0n, lastAccessTime: 0n, lastWriteTime: 0n, changeTime: 0n,
     ...over,
   };
@@ -161,6 +162,17 @@ describe("direntFromEntry", () => {
     expect(d.size).toBe(1234);
     expect(d.mtime).toEqual(new Date(written));
     expect(d.ctime).toEqual(new Date(created));
+  });
+
+  it("exposes attributes and the reparse tag", () => {
+    const plain = direntFromEntry(entryOf({ fileAttributes: 0x20, eaSize: 5 }));
+    expect(plain.attributes).toBe(0x20);
+    expect(reparseTagOf(plain)).toBeUndefined();
+    const link = direntFromEntry(entryOf({ fileAttributes: 0x420, eaSize: IO_REPARSE_TAG_SYMLINK }));
+    expect(link.attributes).toBe(0x420);
+    expect(reparseTagOf(link)).toBe(IO_REPARSE_TAG_SYMLINK);
+    const junction = direntFromEntry(entryOf({ fileAttributes: 0x410, eaSize: IO_REPARSE_TAG_MOUNT_POINT }));
+    expect(reparseTagOf(junction)).toBe(IO_REPARSE_TAG_MOUNT_POINT);
   });
 
   it("maps a directory entry", () => {
